@@ -54,6 +54,7 @@ export function renderWikiConfigSection(tab: LLMWikiSettingTab, containerEl: HTM
       .onChange((value) => { tempSettings.wikiFolder = value; }));
 
   let mineruTokenSetting: Setting | null = null;
+  let mineruBaseUrlSetting: Setting | null = null;
   new Setting(containerEl)
     .setName(tab.getText('markdownConversionBackendName'))
     .setDesc(tab.getText('markdownConversionBackendDesc'))
@@ -63,8 +64,16 @@ export function renderWikiConfigSection(tab: LLMWikiSettingTab, containerEl: HTM
       .setValue(tempSettings.markdownConversionBackend ?? 'native')
       .onChange(value => {
         tempSettings.markdownConversionBackend = value as 'native' | 'mineru';
-        setSettingsVisible([mineruTokenSetting], value === 'mineru');
+        setSettingsVisible([mineruTokenSetting, mineruBaseUrlSetting], value === 'mineru');
       }));
+
+  mineruBaseUrlSetting = new Setting(containerEl)
+    .setName(tab.getText('mineruApiBaseUrlName'))
+    .setDesc(tab.getText('mineruApiBaseUrlDesc'))
+    .addText(text => text
+      .setPlaceholder(tab.getText('mineruApiBaseUrlPlaceholder'))
+      .setValue(tempSettings.mineruApiBaseUrl ?? '')
+      .onChange(value => { tempSettings.mineruApiBaseUrl = value.trim(); }));
 
   mineruTokenSetting = new Setting(containerEl)
     .setName(tab.getText('mineruApiTokenName'))
@@ -76,7 +85,7 @@ export function renderWikiConfigSection(tab: LLMWikiSettingTab, containerEl: HTM
         .onChange(value => { tab.app.secretStorage.setSecret(MINERU_API_TOKEN_SECRET_ID, value.trim()); });
       text.inputEl.type = 'password';
     });
-  setSettingsVisible([mineruTokenSetting], tempSettings.markdownConversionBackend === 'mineru');
+  setSettingsVisible([mineruTokenSetting, mineruBaseUrlSetting], tempSettings.markdownConversionBackend === 'mineru');
   // Granularity + custom limits
   let customEntitySetting: Setting | null = null;
   let customConceptSetting: Setting | null = null;

@@ -750,9 +750,13 @@ export class WikiEngine {
           model: this.settings.model,
           forcePdfSupport: this.settings.forcePdfSupport,
           markdownConversionBackend: this.settings.markdownConversionBackend,
+          mineruApiBaseUrl: this.settings.mineruApiBaseUrl,
         },
         ...(this.settings.markdownConversionBackend === 'mineru'
-          ? { mineruApiToken: this.app.secretStorage.getSecret(MINERU_API_TOKEN_SECRET_ID) ?? '' }
+          ? {
+              mineruApiToken: this.app.secretStorage.getSecret(MINERU_API_TOKEN_SECRET_ID) ?? '',
+              mineruApiBaseUrl: this.settings.mineruApiBaseUrl,
+            }
           : {}),
         onMineruPhase: phase => {
           const key = MINERU_PHASE_KEY[phase];

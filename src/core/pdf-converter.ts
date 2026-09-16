@@ -59,10 +59,13 @@ export interface PdfConversionContext {
     model: string;
     forcePdfSupport?: boolean;
     markdownConversionBackend?: 'native' | 'mineru';
+    mineruApiBaseUrl?: string;
     [k: string]: unknown;
   };
   /** Resolved at the WikiEngine boundary from Obsidian SecretStorage. */
   mineruApiToken?: string;
+  /** Optional custom API Base URL for MinerU backend (e.g. self-hosted / proxy). */
+  mineruApiBaseUrl?: string;
   onMineruPhase?: (phase: 'uploading' | 'waiting' | 'downloading') => void;
   pdfFile: TFile;
   llmClient: LLMClient;

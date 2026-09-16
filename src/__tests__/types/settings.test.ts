@@ -34,6 +34,11 @@ describe('v1.25.0 PR3 PDF settings — defaults', () => {
     expect(DEFAULT_SETTINGS).not.toHaveProperty('mineruApiToken');
     expect(DEFAULT_SETTINGS).not.toHaveProperty('mineruTaskTimeoutMinutes');
   });
+
+  it('mineruApiBaseUrl defaults to empty string and is present on DEFAULT_SETTINGS', () => {
+    expect(DEFAULT_SETTINGS.mineruApiBaseUrl).toBe('');
+    expect(DEFAULT_SETTINGS).toHaveProperty('mineruApiBaseUrl');
+  });
 });
 
 // v1.26.0 (#382 item 2): dedup threshold overrides — three optional

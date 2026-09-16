@@ -117,19 +117,35 @@ function withDeadline<T>(promise: Promise<T>, deadline: number, signal?: AbortSi
   });
 }
 
-function validateRemoteUrl(value: string): string {
+export function resolveMineruBaseUrl(configured?: string): string {
+  const trimmed = configured?.trim();
+  if (!trimmed) return MINERU_API_BASE_URL;
+  return trimmed.replace(/\/+$/, '');
+}
+
+function validateRemoteUrl(value: string, baseUrl: string = MINERU_API_BASE_URL): string {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
     throw new MineruPdfError('MinerU returned an invalid URL.');
   }
-  const host = url.hostname.toLowerCase();
-  const localHost = host === 'localhost' || host.endsWith('.localhost') || host === '[::1]' ||
-    /^(?:127\.|10\.|169\.254\.|192\.168\.)/.test(host) ||
-    /^172\.(?:1[6-9]|2\d|3[01])\./.test(host);
-  if (url.protocol !== 'https:' || url.username || url.password || localHost) {
-    throw new MineruPdfError('MinerU upload and download URLs must be safe HTTPS URLs.');
+  if (url.username || url.password) {
+    throw new MineruPdfError('MinerU upload and download URLs must not contain credentials.');
+  }
+  const isCustomBaseUrl = baseUrl !== MINERU_API_BASE_URL;
+  if (!isCustomBaseUrl) {
+    const host = url.hostname.toLowerCase();
+    const localHost = host === 'localhost' || host.endsWith('.localhost') || host === '[::1]' ||
+      /^(?:127\.|10\.|169\.254\.|192\.168\.)/.test(host) ||
+      /^172\.(?:1[6-9]|2\d|3[01])\./.test(host);
+    if (url.protocol !== 'https:' || localHost) {
+      throw new MineruPdfError('MinerU upload and download URLs must be safe HTTPS URLs.');
+    }
+  } else {
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+      throw new MineruPdfError('MinerU upload and download URLs must be HTTP or HTTPS.');
+    }
   }
   return url.href;
 }
@@ -162,21 +178,24 @@ export async function convertPdfWithMineru(ctx: PdfConversionContext): Promise<C
   // (`:mineru:vlm:v1`) so existing users do not invalidate cache.
   const modelVersion = 'vlm';
 
+  const baseUrl = resolveMineruBaseUrl(ctx.mineruApiBaseUrl ?? ctx.settings.mineruApiBaseUrl);
+
   const sourceHash = await sha256Bytes(bytes, ctx.subtle);
   const cache = createPdfCache(ctx.app);
+  const baseUrlKey = baseUrl === MINERU_API_BASE_URL ? '' : `:${baseUrl}`;
   const cacheKey = await hashCacheKey(
-    `${sourceHash}:mineru:${modelVersion}:v1`,
+    `${sourceHash}:mineru:${modelVersion}:v1${baseUrlKey}`,
     ctx.subtle,
   );
   const cached = await cache.get(cacheKey);
   if (cached) return cached;
 
   const deadline = Date.now() + MINERU_TIMEOUT_MS;
-  const lease = await requestUpload(token, ctx.pdfFile.name, modelVersion, deadline, ctx.abortSignal);
+  const lease = await requestUpload(token, ctx.pdfFile.name, modelVersion, deadline, ctx.abortSignal, baseUrl);
   ctx.onMineruPhase?.('uploading');
   await uploadPdf(lease.uploadUrl, bytes, deadline, ctx.abortSignal);
   ctx.onMineruPhase?.('waiting');
-  const result = await waitForResult(token, lease.taskId, deadline, ctx.abortSignal);
+  const result = await waitForResult(token, lease.taskId, deadline, ctx.abortSignal, baseUrl);
   ctx.onMineruPhase?.('downloading');
   const zipBytes = await downloadResult(result, deadline, ctx.abortSignal);
   if (zipBytes.byteLength > MINERU_MAX_ZIP_BYTES) {
@@ -201,17 +220,18 @@ async function requestUpload(
   modelVersion: 'vlm',
   deadline: number,
   signal?: AbortSignal,
+  baseUrl: string = MINERU_API_BASE_URL,
 ): Promise<{ taskId: string; uploadUrl: string }> {
   const envelope = await mineruRequest(token, '/file-urls/batch', {
     method: 'POST',
     body: JSON.stringify({ files: [{ name: filename }], model_version: modelVersion }),
-  }, deadline, signal);
+  }, deadline, signal, baseUrl);
   const taskId = stringValue(envelope.data?.batch_id);
   const uploadUrl = Array.isArray(envelope.data?.file_urls)
     ? stringValue(envelope.data.file_urls[0])
     : undefined;
   if (!taskId || !uploadUrl) throw new MineruPdfError('MinerU returned an invalid upload response.');
-  return { taskId, uploadUrl: validateRemoteUrl(uploadUrl) };
+  return { taskId, uploadUrl: validateRemoteUrl(uploadUrl, baseUrl) };
 }
 
 async function uploadPdf(url: string, bytes: Uint8Array, deadline: number, signal?: AbortSignal): Promise<void> {
@@ -235,6 +255,7 @@ async function waitForResult(
   taskId: string,
   deadline: number,
   signal?: AbortSignal,
+  baseUrl: string = MINERU_API_BASE_URL,
 ): Promise<string> {
   while (Date.now() < deadline) {
     throwIfAborted(signal);
@@ -244,6 +265,7 @@ async function waitForResult(
       { method: 'GET' },
       deadline,
       signal,
+      baseUrl,
     );
     const results = envelope.data?.extract_result;
     const record = Array.isArray(results) && results.length === 1 && typeof results[0] === 'object'
@@ -253,7 +275,7 @@ async function waitForResult(
     if (state === 'done') {
       const zipUrl = stringValue(record?.full_zip_url);
       if (!zipUrl) throw new MineruPdfError('MinerU returned no result archive URL.');
-      return validateRemoteUrl(zipUrl);
+      return validateRemoteUrl(zipUrl, baseUrl);
     }
     if (state === 'failed') {
       const errMsg = stringValue(record?.err_msg);
@@ -282,10 +304,11 @@ async function mineruRequest(
   request: { method: string; body?: string },
   deadline: number,
   signal?: AbortSignal,
+  baseUrl: string = MINERU_API_BASE_URL,
 ): Promise<MineruEnvelope> {
   throwIfAborted(signal);
   const response = await withDeadline(requestUrl({
-    url: `${MINERU_API_BASE_URL}${path}`,
+    url: `${baseUrl}${path}`,
     method: request.method,
     headers: {
       Authorization: `Bearer ${token}`,

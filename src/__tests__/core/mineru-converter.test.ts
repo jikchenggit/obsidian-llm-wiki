@@ -22,7 +22,12 @@ vi.mock('../../core/pdf-cache', async () => {
 });
 
 import { convertPdfToMarkdown } from '../../core/pdf-converter';
-import { MineruPdfError, convertPdfWithMineru, extractMineruMarkdown } from '../../core/mineru-converter';
+import {
+  MineruPdfError,
+  convertPdfWithMineru,
+  extractMineruMarkdown,
+  resolveMineruBaseUrl,
+} from '../../core/mineru-converter';
 
 function context(overrides: Record<string, unknown> = {}) {
   return {
@@ -269,4 +274,45 @@ describe('extractMineruMarkdown', () => {
 
     await rejection;
   });
+
+  it('dispatches to custom mineruApiBaseUrl and allows custom HTTP upload URLs', async () => {
+    const pdfBuffer = new Uint8Array([1, 2, 3]).buffer;
+    const archive = zipSync({ 'result/full.md': new TextEncoder().encode('# Custom MinerU') });
+    requestUrlMock
+      .mockResolvedValueOnce({
+        status: 200,
+        json: { code: 0, data: { batch_id: 'task-custom', file_urls: ['http://localhost:8000/upload'] } },
+      })
+      .mockResolvedValueOnce({ status: 200, json: {} })
+      .mockResolvedValueOnce({
+        status: 200,
+        json: { code: 0, data: { extract_result: [{ state: 'done', full_zip_url: 'http://localhost:8000/download.zip' }] } },
+      })
+      .mockResolvedValueOnce({ status: 200, arrayBuffer: archive.buffer });
+
+    const ctx = context({
+      app: { vault: { adapter: { readBinary: vi.fn(async () => pdfBuffer) } } },
+      mineruApiBaseUrl: 'http://localhost:8000/api/v4/',
+    });
+    const result = await convertPdfToMarkdown(ctx);
+
+    expect(result.markdown).toBe('# Custom MinerU');
+    expect(requestUrlMock.mock.calls[0][0].url).toBe('http://localhost:8000/api/v4/file-urls/batch');
+    expect(requestUrlMock.mock.calls[2][0].url).toBe('http://localhost:8000/api/v4/extract-results/batch/task-custom');
+    expect([...cacheStore.keys()]).toEqual(['source-hash:mineru:vlm:v1:http://localhost:8000/api/v4']);
+  });
 });
+
+describe('resolveMineruBaseUrl', () => {
+  it('falls back to default MINERU_API_BASE_URL when undefined or blank', () => {
+    expect(resolveMineruBaseUrl()).toBe('https://mineru.net/api/v4');
+    expect(resolveMineruBaseUrl('')).toBe('https://mineru.net/api/v4');
+    expect(resolveMineruBaseUrl('   ')).toBe('https://mineru.net/api/v4');
+  });
+
+  it('trims whitespace and strips trailing slashes for custom base URL', () => {
+    expect(resolveMineruBaseUrl('  https://custom.mineru.org/api/v4///  ')).toBe('https://custom.mineru.org/api/v4');
+    expect(resolveMineruBaseUrl('http://localhost:8000')).toBe('http://localhost:8000');
+  });
+});
+

@@ -65,4 +65,20 @@ describe('MinerU settings', () => {
     expect(setSecret).toHaveBeenCalledWith('karpathywiki-mineru-api-token', 'new-token');
     expect(tab.tempSettings).not.toHaveProperty('mineruApiToken');
   });
+
+  it('reads and writes custom MinerU API base URL setting', () => {
+    controls.clear();
+    const tab = {
+      tempSettings: { ...DEFAULT_SETTINGS, markdownConversionBackend: 'mineru', mineruApiBaseUrl: 'https://proxy.example/api/v4' },
+      app: { secretStorage: { getSecret: vi.fn(), setSecret: vi.fn() } },
+      getText: (key: string) => key,
+    } as unknown as LLMWikiSettingTab;
+
+    renderWikiConfigSection(tab, {} as HTMLElement);
+
+    const baseUrl = controls.get('mineruApiBaseUrlName');
+    expect(baseUrl).toBeDefined();
+    baseUrl?.change?.('  https://custom.mineru.org/api/v4/  ');
+    expect(tab.tempSettings.mineruApiBaseUrl).toBe('https://custom.mineru.org/api/v4/');
+  });
 });
