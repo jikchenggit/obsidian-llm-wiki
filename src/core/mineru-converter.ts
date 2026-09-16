@@ -120,7 +120,144 @@ function withDeadline<T>(promise: Promise<T>, deadline: number, signal?: AbortSi
 export function resolveMineruBaseUrl(configured?: string): string {
   const trimmed = configured?.trim();
   if (!trimmed) return MINERU_API_BASE_URL;
-  return trimmed.replace(/\/+$/, '');
+  return trimmed.replace(/\/+$/, '').replace(/\/file_parse$/, '').replace(/\/+$/, '');
+}
+
+export function isSelfHostedMineruApi(baseUrl: string): boolean {
+  const normalized = baseUrl.trim().replace(/\/+$/, '');
+  if (normalized.endsWith('/v4') || normalized.includes('mineru.net')) {
+    return false;
+  }
+  return true;
+}
+
+export function buildMultipartFormData(
+  boundary: string,
+  fields: Record<string, string>,
+  file: { name: string; bytes: Uint8Array; fieldName?: string },
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const parts: Uint8Array[] = [];
+
+  for (const [key, value] of Object.entries(fields)) {
+    const fieldHeader = `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`;
+    parts.push(encoder.encode(fieldHeader));
+  }
+
+  const fileFieldName = file.fieldName || 'files';
+  const fileHeader = `--${boundary}\r\nContent-Disposition: form-data; name="${fileFieldName}"; filename="${file.name}"\r\nContent-Type: application/pdf\r\n\r\n`;
+  parts.push(encoder.encode(fileHeader));
+  parts.push(file.bytes);
+  parts.push(encoder.encode(`\r\n--${boundary}--\r\n`));
+
+  let totalLength = 0;
+  for (const part of parts) {
+    totalLength += part.byteLength;
+  }
+
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.byteLength;
+  }
+
+  return result;
+}
+
+export function extractMarkdownFromMineruApiResponse(json: unknown, filename?: string): string {
+  if (!json || typeof json !== 'object') {
+    throw new MineruPdfError('MinerU response did not contain markdown content.');
+  }
+
+  const obj = json as Record<string, unknown>;
+
+  if (typeof obj.md_content === 'string' && obj.md_content.trim()) return obj.md_content;
+  if (typeof obj.md === 'string' && obj.md.trim()) return obj.md;
+  if (typeof obj.markdown === 'string' && obj.markdown.trim()) return obj.markdown;
+
+  const results = obj.results;
+  if (results && typeof results === 'object') {
+    const resObj = results as Record<string, unknown>;
+    if (filename && filename in resObj && typeof resObj[filename] === 'object' && resObj[filename] !== null) {
+      const fileRes = resObj[filename] as Record<string, unknown>;
+      const content = fileRes.md_content ?? fileRes.md ?? fileRes.markdown;
+      if (typeof content === 'string' && content.trim()) return content;
+    }
+
+    if (filename) {
+      const baseName = filename.replace(/\.[^/.]+$/, '');
+      if (baseName in resObj && typeof resObj[baseName] === 'object' && resObj[baseName] !== null) {
+        const fileRes = resObj[baseName] as Record<string, unknown>;
+        const content = fileRes.md_content ?? fileRes.md ?? fileRes.markdown;
+        if (typeof content === 'string' && content.trim()) return content;
+      }
+    }
+
+    for (const val of Object.values(resObj)) {
+      if (val && typeof val === 'object' && val !== null) {
+        const sub = val as Record<string, unknown>;
+        const content = sub.md_content ?? sub.md ?? sub.markdown;
+        if (typeof content === 'string' && content.trim()) return content;
+      }
+    }
+  }
+
+  if (obj.data && typeof obj.data === 'object') {
+    try {
+      return extractMarkdownFromMineruApiResponse(obj.data, filename);
+    } catch {
+      // pass through to throw below
+    }
+  }
+
+  throw new MineruPdfError('MinerU response did not contain markdown content.');
+}
+
+async function convertWithSelfHostedMineru(
+  bytes: Uint8Array,
+  filename: string,
+  baseUrl: string,
+  token: string | undefined,
+  deadline: number,
+  signal?: AbortSignal,
+  onPhase?: (phase: MineruPhase) => void,
+): Promise<string> {
+  throwIfAborted(signal);
+  onPhase?.('uploading');
+
+  const boundary = `----MinerUFormBoundary${Math.random().toString(36).slice(2)}${Date.now()}`;
+  const bodyBytes = buildMultipartFormData(
+    boundary,
+    { return_md: 'true' },
+    { name: filename, bytes },
+  );
+
+  const body = bodyBytes.byteOffset === 0 && bodyBytes.byteLength === bodyBytes.buffer.byteLength
+    ? bodyBytes.buffer as ArrayBuffer
+    : bodyBytes.buffer.slice(bodyBytes.byteOffset, bodyBytes.byteOffset + bodyBytes.byteLength) as ArrayBuffer;
+
+  const headers: Record<string, string> = {
+    'Content-Type': `multipart/form-data; boundary=${boundary}`,
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  onPhase?.('waiting');
+  const response = await withDeadline(requestUrl({
+    url: `${baseUrl}/file_parse`,
+    method: 'POST',
+    headers,
+    body,
+    throw: false,
+  }), deadline, signal);
+
+  if (response.status < 200 || response.status >= 300) {
+    throw new MineruPdfError(`MinerU request failed with HTTP ${response.status}.`);
+  }
+
+  return extractMarkdownFromMineruApiResponse(response.json, filename);
 }
 
 function validateRemoteUrl(value: string, baseUrl: string = MINERU_API_BASE_URL): string {
@@ -151,8 +288,11 @@ function validateRemoteUrl(value: string, baseUrl: string = MINERU_API_BASE_URL)
 }
 
 export async function convertPdfWithMineru(ctx: PdfConversionContext): Promise<ConversionResult> {
+  const baseUrl = resolveMineruBaseUrl(ctx.mineruApiBaseUrl ?? ctx.settings.mineruApiBaseUrl);
+  const isSelfHosted = isSelfHostedMineruApi(baseUrl);
+
   const token = ctx.mineruApiToken?.trim();
-  if (!token) throw new MineruPdfError('A MinerU API token is required.');
+  if (!token && !isSelfHosted) throw new MineruPdfError('A MinerU API token is required.');
 
   // Fast-fail against the file's cached `stat.size` before paying the
   // IO of `readBinary`. The byte-length check below is the authoritative
@@ -178,8 +318,6 @@ export async function convertPdfWithMineru(ctx: PdfConversionContext): Promise<C
   // (`:mineru:vlm:v1`) so existing users do not invalidate cache.
   const modelVersion = 'vlm';
 
-  const baseUrl = resolveMineruBaseUrl(ctx.mineruApiBaseUrl ?? ctx.settings.mineruApiBaseUrl);
-
   const sourceHash = await sha256Bytes(bytes, ctx.subtle);
   const cache = createPdfCache(ctx.app);
   const baseUrlKey = baseUrl === MINERU_API_BASE_URL ? '' : `:${baseUrl}`;
@@ -191,6 +329,30 @@ export async function convertPdfWithMineru(ctx: PdfConversionContext): Promise<C
   if (cached) return cached;
 
   const deadline = Date.now() + MINERU_TIMEOUT_MS;
+
+  if (isSelfHosted) {
+    const markdown = await convertWithSelfHostedMineru(
+      bytes,
+      ctx.pdfFile.name,
+      baseUrl,
+      token,
+      deadline,
+      ctx.abortSignal,
+      ctx.onMineruPhase,
+    );
+    const entry: ConversionResult = {
+      markdown,
+      metadata: {
+        convertedAt: new Date().toISOString(),
+        converter: `mineru/${modelVersion}`,
+      },
+    };
+    await cache.set(cacheKey, entry);
+    return entry;
+  }
+
+  if (!token) throw new MineruPdfError('A MinerU API token is required.');
+
   const lease = await requestUpload(token, ctx.pdfFile.name, modelVersion, deadline, ctx.abortSignal, baseUrl);
   ctx.onMineruPhase?.('uploading');
   await uploadPdf(lease.uploadUrl, bytes, deadline, ctx.abortSignal);

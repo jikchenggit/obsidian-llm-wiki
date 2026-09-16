@@ -27,6 +27,9 @@ import {
   convertPdfWithMineru,
   extractMineruMarkdown,
   resolveMineruBaseUrl,
+  isSelfHostedMineruApi,
+  buildMultipartFormData,
+  extractMarkdownFromMineruApiResponse,
 } from '../../core/mineru-converter';
 
 function context(overrides: Record<string, unknown> = {}) {
@@ -313,6 +316,75 @@ describe('resolveMineruBaseUrl', () => {
   it('trims whitespace and strips trailing slashes for custom base URL', () => {
     expect(resolveMineruBaseUrl('  https://custom.mineru.org/api/v4///  ')).toBe('https://custom.mineru.org/api/v4');
     expect(resolveMineruBaseUrl('http://localhost:8000')).toBe('http://localhost:8000');
+    expect(resolveMineruBaseUrl('http://localhost:8000/file_parse')).toBe('http://localhost:8000');
+  });
+});
+
+describe('isSelfHostedMineruApi', () => {
+  it('identifies cloud v4 URLs vs self-hosted mineru-api URLs', () => {
+    expect(isSelfHostedMineruApi('https://mineru.net/api/v4')).toBe(false);
+    expect(isSelfHostedMineruApi('https://proxy.corp/api/v4')).toBe(false);
+    expect(isSelfHostedMineruApi('http://localhost:8000')).toBe(true);
+    expect(isSelfHostedMineruApi('http://192.168.1.50:8000')).toBe(true);
+    expect(isSelfHostedMineruApi('http://my-server:8000/')).toBe(true);
+  });
+});
+
+describe('buildMultipartFormData', () => {
+  it('constructs valid multipart binary payload with boundary', () => {
+    const boundary = 'test-boundary';
+    const body = buildMultipartFormData(boundary, { return_md: 'true' }, { name: 'test.pdf', bytes: new Uint8Array([1, 2, 3]) });
+    const text = new TextDecoder().decode(body);
+    expect(text).toContain('--test-boundary\r\nContent-Disposition: form-data; name="return_md"\r\n\r\ntrue\r\n');
+    expect(text).toContain('--test-boundary\r\nContent-Disposition: form-data; name="files"; filename="test.pdf"\r\n');
+    expect(text).toContain('\r\n--test-boundary--\r\n');
+  });
+});
+
+describe('extractMarkdownFromMineruApiResponse', () => {
+  it('extracts from results[filename].md_content', () => {
+    const json = { results: { 'doc.pdf': { md_content: '# Extracted from results' } } };
+    expect(extractMarkdownFromMineruApiResponse(json, 'doc.pdf')).toBe('# Extracted from results');
+  });
+
+  it('extracts from results[filename].md or root md_content', () => {
+    expect(extractMarkdownFromMineruApiResponse({ results: { 'doc': { md: '# Extracted md' } } }, 'doc.pdf')).toBe('# Extracted md');
+    expect(extractMarkdownFromMineruApiResponse({ md_content: '# Root md_content' })).toBe('# Root md_content');
+  });
+
+  it('throws on empty or missing markdown content', () => {
+    expect(() => extractMarkdownFromMineruApiResponse({})).toThrow(/did not contain markdown/);
+  });
+});
+
+describe('convertPdfWithMineru (self-hosted mode)', () => {
+  it('calls /file_parse with multipart form data without requiring token', async () => {
+    const pdfBuffer = new Uint8Array([1, 2, 3]).buffer;
+    requestUrlMock.mockResolvedValueOnce({
+      status: 200,
+      json: {
+        results: {
+          'paper.pdf': {
+            md_content: '# Self-Hosted Markdown Output',
+          },
+        },
+      },
+    });
+
+    const ctx = context({
+      app: { vault: { adapter: { readBinary: vi.fn(async () => pdfBuffer) } } },
+      mineruApiToken: '', // No token required for self-hosted
+      mineruApiBaseUrl: 'http://192.168.1.100:8000',
+    });
+
+    const result = await convertPdfWithMineru(ctx);
+    expect(result.markdown).toBe('# Self-Hosted Markdown Output');
+    expect(requestUrlMock).toHaveBeenCalledTimes(1);
+    const call = requestUrlMock.mock.calls[0][0];
+    expect(call.url).toBe('http://192.168.1.100:8000/file_parse');
+    expect(call.method).toBe('POST');
+    expect(call.headers['Content-Type']).toContain('multipart/form-data; boundary=');
+    expect(call.headers.Authorization).toBeUndefined();
   });
 });
 
