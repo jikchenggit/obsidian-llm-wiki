@@ -145,7 +145,7 @@ That's it. The plugin modifies nothing in your original notes — only creates n
 - **🏷️ Mandatory aliases** — every page ships with at least one alias (translation, abbreviation, variant) so cross-language duplicate detection works.
 - **🔄 Tiered duplicate detection** — Tier 1 (direct name match: cross-language, abbreviation, high-similarity titles) is always verified; Tier 2 (shared links, medium similarity) fills remaining token budget.
 - **🧩 Smart merge & contradiction state** — duplicates merge while preserving aliases; contradictions are flagged with source attribution; `reviewed: true` pages are protected from overwrite.
-- **🎨 Custom tag vocabulary** — define your own entity-type and concept-type tags in Settings → Wiki → Tag Vocabulary → *Custom*. The vocabulary is a schema-injection hint, not a wire-level gate — small/local models may still drift (about one in ten returns the model's built-in taxonomy). Lint surfaces the rest. Design anchor for schema enforcement: [Issue #328](https://github.com/GD4AI/obsidian-llm-wiki/issues/328).
+- **🎨 One tag vocabulary, yours** — the tags a page may carry come from three places you control: the nested tags of your notes, the nested tags already on wiki pages, and the list in Settings → Wiki → Tag Vocabulary → *Custom* (the place for a term no note carries yet). Prompt, write gate, lint and retag all read this one list, so what the model is offered is exactly what lands on disk; a value outside it is dropped, never written. Source pages carry it too, next to their form tag. Small/local models still drift (about one in ten returns the model's built-in taxonomy) — the gate catches it, and Lint reports a page left without tags. Design anchor: [Issue #328](https://github.com/GD4AI/obsidian-llm-wiki/issues/328).
 
 ### 📄 Document / PDF / Image ingest
 
@@ -156,6 +156,7 @@ Five on-ramps, switchable per ingest:
 3. **🖥️ Local OCR on Apple Silicon** — [oMLX](https://github.com/jundot/omlx) bundles Microsoft Markitdown as a built-in PDF→Markdown backend. Enable Markitdown in oMLX, load [Baidu Unlimited-OCR](https://huggingface.co/baidu/Unlimited-OCR) (3B / 570M-active, open-sourced 2026-06) as the vision model, point the plugin at oMLX as a Custom OpenAI-Compatible provider, turn on **Force PDF Support**, pick the multimodal model oMLX is serving. The PDF never leaves your machine.
 4. **🛠️ Third-party extractor (MinerU online UI)** — use the [MinerU Extractor online service](https://mineru.net/OpenSourceTools/Extractor) for a quick manual UI when you don't want to wire up an API token. Download the converted `.md`, drop it in your vault outside the wiki folder, and ingest as a regular Markdown note.
 5. **🔌 Force PDF Support** — for any other OpenAI/Anthropic-compatible endpoint that accepts file parts, the plugin attempts the call (Settings → LLM Configuration → Advanced). The endpoint decides; failures surface as a localized Notice.
+6. **🖼️ Embedded Markdown images** — turn on *Analyze embedded images during Markdown ingestion* in Advanced settings to analyze every eligible local `![[image.png]]` and `![alt](image.png)` embed. Each image is analyzed with its nearest Markdown paragraphs, sent in 20 MiB visual-evidence packages, and capped at 10 MiB; remote URLs are never downloaded. For testable per-image output, optionally enable *Save embedded image visual evidence to source page* to add a collapsible audit section to the generated source page.
 
 **Caveat for Office formats:** Obsidian does not natively render `.docx` / `.xlsx` / `.pptx` ([file-formats](https://obsidian.md/help/file-formats)), so the practical workflow for Office files is: MinerU converts to `.md`, the plugin ingests that `.md` into wiki pages, and the original Office file is kept around for reference. Use a community plugin like Pandoc Plugin / Docxer / Md Importer / Office Reader if you need to inline-preview Office files.
 
@@ -394,7 +395,7 @@ Thanks to the following for supporting the project:
 
 ## 📜 License & Credits
 
-Apache License, Version 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License, Version 2.0 — see [LICENSE](LICENSE), [NOTICE](NOTICE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 **Built on:**
 - 💡 [Andrej Karpathy's LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) — the original concept

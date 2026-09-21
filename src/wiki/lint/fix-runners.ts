@@ -9,7 +9,8 @@ import { PROMPTS } from '../../prompts';
 import { parseJsonResponse } from '../../core/json';
 import { detectRateLimitFailures, formatRateLimitNotice } from '../../core/rate-limit';
 import { resolveModelForTask } from '../../core/model-resolver';
-import { getActiveEntityTags, getActiveConceptTags, getActiveSourceTags } from '../../core/tag-vocab';
+import { getActiveSourceTags } from '../../core/tag-vocab';
+import { activeVocabulary, domainVocabulary } from '../../core/vocabulary';
 import { mergeFrontmatterArrayField, replaceFrontmatterArrayField, parseFrontmatter } from '../../core/frontmatter';
 import { renderTemplate } from '../../core/template-renderer';
 import { TOKENS_LINT_ALIAS_BATCH, NOTICE_ERROR, NOTICE_RATE_LIMIT } from '../../constants';
@@ -17,6 +18,7 @@ import { buildWikiLanguageDirective } from '../system-prompts';
 import { TagViolation } from './scanners';
 import { AliasGenerationLLMSchema, TagFixLLMSchema } from '../../llm-sdk/output-schemas';
 import { callLlm } from '../../core/llm-dispatch';
+import { LINT_WRITE_INTENT } from '../../types';
 
 // Issue #94: Status bar "click to cancel" already exists, but the fix-runner
 // functions in this module previously never received the AbortSignal. Each
@@ -130,7 +132,28 @@ export async function runAliasCompletion(
             const mergedAliases = Array.isArray(fmAfter?.aliases) ? fmAfter.aliases : [];
             const newAliases = mergedAliases.length - existingAliases.length;
 
-            await ctx.app.vault.adapter.write(page.path, updated);
+            // #603 slice 3: was `ctx.app.vault.adapter.write(page.path, updated)`.
+            // `adapter.write` sits below Obsidian's event layer, so the metadata
+            // cache never learned the aliases had changed and `vault.on('modify')`
+            // never fired — the fix landed on disk and stayed invisible until a
+            // reindex. `LINT_WRITE_INTENT` keeps this a surgical frontmatter edit
+            // (no guard over the body, no notification) while going through the
+            // engine's `rawWrite`, which uses the vault API and retries.
+            //
+            // It is not `RAW_WRITE_INTENT` because of two fields. The cancel
+            // owner: these writes belong to a lint run, and the engine's write
+            // gate reads the controller the intent names — the ingest's would
+            // have stopped them when the user cancelled an ingest, and let them
+            // continue when the user cancelled the lint. And `create: false`:
+            // this path writes a page the scan already saw, so if it is gone by
+            // the time the LLM returns it must stay gone — see
+            // `LINT_WRITE_INTENT` in `types.ts` for why that is a correctness
+            // requirement.
+            await ctx.wikiEngine.writeFileWithIntent(page.path, updated, LINT_WRITE_INTENT);
+            // Known gap (#763): the call cannot tell an update from a skip, so a
+            // page that vanished during the LLM call is still counted as fixed.
+            // Needs a return value, which is a signature change across every
+            // consumer of `createOrUpdateFile`.
             results.push(`- [[${pageRel}]]: added ${newAliases} aliases (total ${mergedAliases.length})`);
             return { success: true, name: page.basename, count: newAliases };
           }
@@ -530,11 +553,13 @@ export async function runRetagViolations(
         const bodyPreview = body.slice(0, 400).replace(/\n+/g, ' ').trim();
 
         // Active vocabulary for the page's type
-        const validVocab = v.pageType === 'entity'
-          ? getActiveEntityTags(ctx.settings)
-          : v.pageType === 'concept'
-            ? getActiveConceptTags(ctx.settings)
-            : getActiveSourceTags(ctx.settings);
+        // One vocabulary (vocabulary.ts) — the same list the system prompt
+        // below renders and the write gate enforces. A source page carries
+        // the closed form list next to the `Group/Value` view of it; the flat
+        // identity types belong to entity and concept pages.
+        const validVocab = v.pageType === 'entity' || v.pageType === 'concept'
+          ? activeVocabulary(ctx.app, ctx.settings, v.pageType)
+          : [...getActiveSourceTags(ctx.settings), ...domainVocabulary(ctx.app, ctx.settings)];
 
         // #328 Phase 1 follow-up: the active tag vocabulary section is now
         // injected exactly once per LLM call at the system layer (by the
@@ -601,7 +626,15 @@ Task: Return a JSON object with a single field "tags" that is an array of string
         // LLM's retag un-applied. The replace helper also handles the
         // block-style case correctly.
         const updated = replaceFrontmatterArrayField(content, 'tags', safeNewTags);
-        await ctx.app.vault.adapter.write(v.path, updated);
+        // #603 slice 3: was `ctx.app.vault.adapter.write(v.path, updated)`. Note
+        // how inconsistent that was with its own neighbours — `:505` resolves the
+        // TFile with `getAbstractFileByPath` and `:524` reads it with
+        // `vault.read`. That is what settled the design record's open question:
+        // `adapter.write` was an older idiom here, not a considered choice. The
+        // cancel owner is `lint` — see the note on the other site above.
+        await ctx.wikiEngine.writeFileWithIntent(v.path, updated, LINT_WRITE_INTENT);
+        // Known gap (#763): still reported as `fixed` when the write was skipped
+        // for a page that vanished during the LLM call. Same signature change.
         return {
           v,
           kind: 'fixed' as const,

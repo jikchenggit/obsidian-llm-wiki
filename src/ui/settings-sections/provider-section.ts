@@ -39,6 +39,7 @@ import { renderRangeSlider } from '../settings-helpers';
 import { getCodexAuthUiState } from '../openai-codex-auth-controls';
 import { getBedrockAuthUiState } from '../bedrock-auth-controls';
 import { resolveInitialApiKey } from '../../llm-sdk/provider-api-key-resolver';
+import { parseCustomHeaders } from '../../llm-sdk/compat-headers';
 
 export function renderProviderSection(tab: LLMWikiSettingTab, containerEl: HTMLElement): void {
   const { tempSettings } = tab;
@@ -156,15 +157,52 @@ export function renderProviderSection(tab: LLMWikiSettingTab, containerEl: HTMLE
   }
 
   // Base URL
-  if (tempSettings.provider === 'custom' || tempSettings.provider === 'anthropic-compatible' || (providerConfig && tempSettings.baseUrl !== providerConfig.baseUrl)) {
+  const isCustomUrlProvider = tempSettings.provider === 'custom'
+    || tempSettings.provider === 'custom-responses'
+    || tempSettings.provider === 'anthropic-compatible';
+  if (isCustomUrlProvider || (providerConfig && tempSettings.baseUrl !== providerConfig.baseUrl)) {
     new Setting(containerEl)
       .setName(tab.getText('baseUrlName'))
-      .setDesc(tempSettings.provider === 'custom' || tempSettings.provider === 'anthropic-compatible'
+      .setDesc(isCustomUrlProvider
         ? tab.getText('baseUrlDescCustom') : tab.getText('baseUrlDescOverride'))
       .addText(text => text
         .setPlaceholder(providerConfig?.baseUrl || 'https://api.example.com/v1')
         .setValue(tempSettings.baseUrl)
         .onChange((value) => { tempSettings.baseUrl = value; tempSettings.llmReady = false; }));
+
+    // Issue #723: custom request headers, placed directly below the base URL
+    // rather than in the bottom Advanced panel — the two are configured
+    // together, and a gateway that needs extra headers is usually the reason the
+    // user is editing this section at all.
+    //
+    // Skipped for the Anthropic-compatible provider, which routes to
+    // `AnthropicSdkClient` and would ignore the field entirely: a setting that
+    // silently does nothing is worse than one that is absent.
+    if (tempSettings.provider !== 'anthropic-compatible') {
+      // Issue #723: a malformed line is dropped by `parseCustomHeaders` rather
+      // than becoming a header named after whatever preceded the colon. That is
+      // the right behaviour but an invisible one, so the count is surfaced here
+      // — on open as well as on edit, so a saved-but-malformed value is visible
+      // before the user touches the field again.
+      const describeHeaders = (raw: string): string => {
+        const base = tab.getText('customHeadersDesc');
+        const { invalid } = parseCustomHeaders(raw);
+        return invalid > 0
+          ? `${base} ${tab.getText('customHeadersInvalid').replace('{}', String(invalid))}`
+          : base;
+      };
+      const headersSetting = new Setting(containerEl)
+        .setName(tab.getText('customHeadersName'))
+        .setDesc(describeHeaders(tempSettings.customHeaders ?? ''))
+        .addTextArea(text => text
+          .setPlaceholder('X-My-Header: value')
+          .setValue(tempSettings.customHeaders ?? '')
+          .onChange((value) => {
+            tempSettings.customHeaders = value;
+            tempSettings.llmReady = false;
+            headersSetting.setDesc(describeHeaders(value));
+          }));
+    }
   }
 
   // v1.24.1 PATCH Bedrock Stage 1 - region selector (only when provider

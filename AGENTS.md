@@ -176,6 +176,8 @@ gh pr review <N> --body "<file>"   # ← MANDATORY. Formal review event lands on
 gh pr merge <N> --admin --squash --delete-branch   # ← ONLY after user said "merge it"
 ```
 
+- **A PR body is not the commit-message file.** `git log` wants ~80-column wrapping; GitHub renders a single newline in a PR or issue body as a **hard break**, so a wrapped paragraph arrives on the web as a column of ~80-character fragments. Same content, two renderings: write the body with one long line per paragraph and let the page reflow it, and keep the commit message wrapped. The symptom reappears whenever `--body-file` is handed the same file that was passed to `git commit -F`. Caught 2026-09-16 on #733. Check before posting — `awk 'length>0 && length<88' <body-file>` should return only markdown-structure lines (headings, list items, table rows), never prose.
+
 - **Scan the body before merging.** A closing keyword needs no intent and does
   not have to aim at an issue. Writing the fix reference as prose — "its fix
   #684" — parsed as `fix #684` and closed **PR #684** one second after the PR
@@ -189,6 +191,8 @@ gh pr merge <N> --admin --squash --delete-branch   # ← ONLY after user said "m
 - Anti-pattern: "`gh pr merge --admin` doesn't enforce reviews, so I can skip --approve." Wrong — `--admin` bypasses the **requirement** rule, not the **review event** rule. Two separate audit surfaces.
 
 **Reviewing PRs (added 2026-09-12, after #570):** a PR decided against is **closed** once the contributor has had a fair window to answer (roughly two weeks of silence), with the decision comment naming in one line what would reopen it. An open PR states that merging is still possible — a closed one cannot collect a stray review at all.
+
+**Filing issues (added 2026-09-17, after #735 / #736):** an issue whose premise is a *missing capability* must name that capability as its acceptance criteria — or not be filed yet. Filing "X has no Y path" and then building Y in the next PR without linking them produces an issue that reads as unstarted work while the work is under review; a PR body written in between can even call the delivered capability "the open question", which is how it happened here. Link at the moment implementation starts (`Closes #N` in the body). And when an issue's own analysis turns out to be wrong, **record the correction on the issue rather than editing it away** — the route that was not needed is information about why the right one was cheap (#735 proposed a bespoke adapter; the bundled `@ai-sdk/openai.responses()` meant the work was a routing decision).
 
 Every review submission MUST begin with the signal check:
 
@@ -297,6 +301,16 @@ English, conventional commits: `feat:` `fix:` `docs:` `refactor:` `test:` `chore
 **Auto-close:** append `Closes #N` (or `Fixes #N` / `Resolves #N`) to commit body. NEVER use `gh issue close` or UI close — let the commit message do it.
 
 **Author identity:** canonical `green-dalii <654534332@qq.com>`. NEW commits (incl. `--amend` and squash) MUST use lowercase canonical form. **Maintainer commits DO NOT include any AI-generated trailer** — no `Co-Authored-By:`, no `Generated with`, no equivalent marker from **any** AI agent (Claude Code, Codex, Cursor, Pi, …). AI tooling may legitimately assist authoring, but the commit's audit trail must read as a single human author (per [[feedback_co_authored_by_format]]). External contributors write their own trailers — preserve verbatim on merge.
+
+**A squash merge is how a contributor's trailer reaches a maintainer commit (2026-09-20).** GitHub's squash message concatenates the branch's commit messages, so any trailer on any branch commit lands in the squash commit — whose `author` is the **PR author**, not the merger, which is why the rule is not "do not write a trailer" but "**read the message you are about to commit**". Found by auditing `main`: three commits authored by the maintainer carry `Co-Authored-By: Claude Code`, all three squash merges of his own PRs from 2026-08-30/31, all three unrewritable (protected `main`, released history). One of them is `e054012d` — *"docs: remove Claude residue from process docs; AGENTS.md becomes canonical"* — the commit whose subject is clearing Claude residue. So: before `gh pr merge --squash`, run the trailer scan against the **draft message**, not against the branch. When the branch carries one and the contributor owns it, prefer `--subject`/`--body` (or edit in the UI) so the trailer stays on the contributor's own work and off the merger's.
+
+```bash
+git log origin/main..HEAD --format=%B | grep -inE '^(co-authored-by|generated with|signed-off-by|assisted-by):'   # → must be empty for YOUR commits
+```
+
+**A maintainer-invoked `gh pr update-branch --rebase` rewrites the contributor's commit identity.** It rebases with the invoker's credentials, so every rebased commit keeps its `author` but takes `committer = maintainer` — verified on #656 (2026-09-20): five commits went from `committer=Jan Heldal` to `committer=Greener-Dalii`. Credit is not lost (`author` drives the contributors graph and `git log --author`), and a squash merge discards it entirely, so this is not a correctness problem — but it *is* a visible artifact on someone else's commits, and the alternative (merging `main` into the branch) leaves their identity untouched. Choose deliberately rather than by habit.
+
+**Verify the commit, not the command.** A commit that reports success can still carry the wrong content. `git commit --amend -F <msg>` without a prior `git add` commits the *message* plus whatever was already staged — so a fix made immediately before it is left behind while the message announces it. That is worse than a missing commit: the description disagrees with the contents, so a reader who diffs the change concludes they misread, and the audit trail itself is what got corrupted. Two habits close it — `git status --porcelain` must be **empty** immediately after every commit, and amending to change content means `git add` first (use `--no-edit` when the message is already right). Confirm with `git show HEAD:<path>`, or re-read the branch from GitHub, rather than trusting the exit code. Caught 2026-09-17 on #736, whose body announced a preset-ordering fix its diff did not contain.
 
 ---
 

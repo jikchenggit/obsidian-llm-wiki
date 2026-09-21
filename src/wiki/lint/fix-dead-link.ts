@@ -1,4 +1,5 @@
 import { EngineContext } from '../../types';
+import { activeVocabularyLists } from '../../core/vocabulary';
 import { PROMPTS } from '../../prompts';
 import { TOKENS_LINT_PAGE_FIX, WIKI_SUBFOLDERS, CANDIDATE_WINDOW_TOP_K } from '../../constants';
 import { buildSystemPrompt } from '../system-prompts';
@@ -11,7 +12,6 @@ import {
   buildDeadLinkReplacement,
   replaceDeadLink,
 } from '../../core/dead-link-detector';
-import { getExistingWikiPages } from './get-existing-pages';
 import { selectCandidateWindow, contextAround } from '../../core/candidate-window';
 import { FixDeadLinkSchema, type FixDeadLink } from '../../llm-sdk/output-schemas';
 import { localDateStamp } from '../../core/format';
@@ -163,10 +163,7 @@ export async function fixDeadLink(
   sourcePath: string,
   targetName: string
 ): Promise<string> {
-  const existingPages = await getExistingWikiPages(
-    ctx.app,
-    ctx.settings.wikiFolder
-  );
+  const existingPages = await ctx.getExistingWikiPages();
 
   // ---- Pre-check: deterministic title + alias match ----
   const sourceContent =
@@ -216,7 +213,8 @@ export async function fixDeadLink(
   const systemPrompt = await buildSystemPrompt(
     ctx.settings,
     ctx.getSchemaContext,
-    'lint'
+    'lint',
+    activeVocabularyLists(ctx.app, ctx.settings)
   );
   const disableThinking = ctx.settings.disableThinking;
 

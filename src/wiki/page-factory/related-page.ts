@@ -22,7 +22,7 @@ import { cleanMarkdownResponse } from '../../core/markdown';
 import { captureFinish } from '../../llm-sdk/finish-reason';
 import { mergeFrontmatter, parseFrontmatter } from '../../core/frontmatter';
 import { incomingTypeTag } from '../../core/tag-vocab';
-import { collectActiveVocabulary } from '../../core/domain-axis';
+import { activeVocabulary } from '../../core/vocabulary';
 import { stripMentionsSection } from '../../core/mentions-parser';
 import { guardBodyRewrite } from '../../core/paragraph-provenance';
 import { renderTemplate } from '../../core/template-renderer';
@@ -32,7 +32,6 @@ import {
 } from '../../core/section-header-canonicalizer';
 import { applyRelatedLinks } from './related-links';
 import { getSectionLabels } from '../system-prompts';
-import { getExistingWikiPages } from '../lint/get-existing-pages';
 import { UNIVERSAL_LINK_CONSTRAINTS } from '../prompts/constraints';
 import { appendToReviewedPage, type MergeContext } from './merge-page';
 import { assembleFinalContent } from './mentions-integration';
@@ -66,10 +65,7 @@ export async function updateRelatedPage(
   sourceFile: TFile | { path: string; basename: string },
   sourceSlug?: string,
 ): Promise<string | null> {
-  const existingPages = await getExistingWikiPages(
-    ctx.app as never,
-    ctx.settings.wikiFolder,
-  );
+  const existingPages = await ctx.getExistingWikiPages();
   // A related page is an entity or concept page. The title index spans the
   // whole wiki folder, and a source page shares its basename with the entity
   // its note is about (`sources/Zytokine` next to `entities/Zytokine`), so a
@@ -109,7 +105,7 @@ export async function updateRelatedPage(
   const { frontmatter, body: existingBody } = mergeFrontmatter(
     existingContent,
     sourceSlug ? `sources/${sourceSlug}` : sourceFile.path,
-    incomingTypeTag(ctx.settings, asEntity ? 'entity' : 'concept', newInfo?.type, collectActiveVocabulary(ctx.app as never, ctx.settings)),
+    incomingTypeTag(ctx.settings, asEntity ? 'entity' : 'concept', newInfo?.type, activeVocabulary(ctx.app as never, ctx.settings, asEntity ? 'entity' : 'concept')),
   );
 
   // Issue #131: when the source extracted nothing matching this page, skip the

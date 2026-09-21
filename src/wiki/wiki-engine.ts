@@ -15,10 +15,15 @@ import {
   WikiPageRef,
   VALID_SOURCE_TAGS,
   DEFAULT_SOURCE_TAG,
+  WriteIntent,
+  FULL_WRITE_INTENT,
+  LOG_WRITE_INTENT,
+  RAW_WRITE_INTENT,
+  STAMP_WRITE_INTENT,
 } from '../types';
 import { PROMPTS } from '../prompts';
-import { normalizeHeadingSpacing } from '../core/markdown-spacing';
 import { getText } from '../core/i18n';
+import { applyPageGuard } from './page-write-guard';
 import { buildRepetitionPenaltyHint } from '../core/repetition-penalty-hint';
 import { formatTaskUsage, snapshotTaskUsage, taskUsageSince } from '../core/llm-task-usage';
 import { TEXTS } from '../texts';
@@ -28,12 +33,11 @@ import { shapeRelatedLists, kindOf } from '../core/related-shaping';
 import { withAbortSignal } from '../core/llm-abort';
 import { isIngestableSource } from '../core/folder-scope';
 import { resolveSourceSlug } from '../core/source-slug';
-import { parseFrontmatter, upsertFrontmatterField, mergeFrontmatterArrayField, replaceFrontmatterArrayField, extractBody } from '../core/frontmatter';
+import { parseFrontmatter, upsertFrontmatterField, mergeFrontmatterArrayField, replaceFrontmatterArrayField, extractBody, enforceFrontmatterConstraints } from '../core/frontmatter';
 import { setGenerationComplete } from '../core/incomplete-page-cleaner';
 import { convertPdfToMarkdown, UnsupportedProviderError, EncryptedPdfError } from '../core/pdf-converter';
 import { MineruPdfError, MINERU_PHASE_KEY } from '../core/mineru-converter';
 import { hashBody, checkContentRequirements } from '../core/source-requirements';
-import { normalizeProvenanceMarkers } from '../core/provenance-marker';
 import { resolveModelForTask } from '../core/model-resolver';
 import type { SourceRejection } from '../core/source-requirements';
 // v1.25.1 Phase C-PR1: detectRateLimitFailures is invoked exclusively by runBatchedWithRetry (engine-internals/page-batch-runner.ts).
@@ -42,11 +46,13 @@ import { extractSourceTags } from '../core/arrays';
 import { buildVaultResolver } from '../core/related-link-corrector';
 import { gateCandidates, applyCoverageThreshold, applyOutcomeTable, type StubCandidate } from '../core/candidate-gate';
 import { buildStubIdentityResolver, createDissentStubs, stubPath } from './page-factory/stub-page';
-import { selectDomains, collectActiveVocabulary } from '../core/domain-axis'; // domain axis stages 3-5 (#568)
+import { selectDomains } from '../core/domain-axis'; // domain axis stages 3-5 (#568)
+import { activeVocabulary, activeVocabularyLists, domainVocabulary as domainVocabularyOf } from '../core/vocabulary';
 import { getSourceLanguage, isCrossLanguage } from '../core/source-language';
 import { cleanMarkdownResponse } from '../core/markdown';
 import { stampSourcePageHead } from '../core/source-page-head';
 import { injectMentionsSection } from '../core/mentions-injector';
+import { injectEmbeddedImageEvidenceSection } from '../core/embedded-image-evidence';
 import { SchemaManager, SchemaTask } from '../schema/schema-manager';
 import {
   buildSystemPrompt,
@@ -54,20 +60,19 @@ import {
   getSourcePageHeadLabels,
   applySectionLabels,
 } from './system-prompts';
-import { getExistingWikiPages } from './lint/get-existing-pages';
+import { WikiPageIndex } from './lint/get-existing-pages';
 import { correctRelatedLinkPrefixes, repointFolderTypedLinks } from '../core/related-link-corrector';
 import { fixDeadLink } from './lint/fix-dead-link';
 import { fillEmptyPage } from './lint/fill-empty-page';
-import { deleteEmptyStubs } from './lint/delete-empty-stubs';
+import { deleteEmptyStubs, type DeleteEmptyStubsResult } from './lint/delete-empty-stubs';
 import { linkOrphanPage } from './lint/link-orphan';
 import { mergeDuplicatePages } from './lint/merge-duplicates';
 import { fixPollutedPage } from './lint/fix-polluted-page';
 import { ContradictionManager } from './contradictions';
-import { fixPollutedSources } from '../core/sources-normalizer';
 // v1.25.1 Phase C-PR1: buildLogHeader moved into LogWriter.
 import { UNIVERSAL_LINK_CONSTRAINTS } from './prompts/constraints';
 import { SourceAnalyzer } from './source-analyzer';
-import { TOKENS_PAGE_GENERATION, NOTICE_ABORT, NOTICE_RATE_LIMIT, NOTICE_NORMAL, NOTICE_SHORT, PAGES_CACHE_TTL_MS, COMPATIBLE_SOURCE_EXTENSIONS, MINERU_API_TOKEN_SECRET_ID, MINERU_CONVERSION_EXTENSIONS, MINERU_MAX_PDF_MB, MINERU_MAX_PDF_PAGES } from '../constants';
+import { TOKENS_PAGE_GENERATION, NOTICE_ABORT, NOTICE_RATE_LIMIT, NOTICE_NORMAL, NOTICE_SHORT, INGESTED_HASHES_TTL_MS, COMPATIBLE_SOURCE_EXTENSIONS, MINERU_API_TOKEN_SECRET_ID, MINERU_CONVERSION_EXTENSIONS, MINERU_MAX_PDF_MB, MINERU_MAX_PDF_PAGES } from '../constants';
 import { PageFactory } from './page-factory';
 import { ConversationIngestor, ConversationOrchestration, formatConversation, ConversationHistory } from './conversation-ingest';
 import type { Graph } from '../core/build-graph';
@@ -176,11 +181,13 @@ export class WikiEngine {
   private onLintStart: (() => void) | null = null;
   private onLintEnd: (() => void) | null = null;
   private onStatusBarUpdate: ((text: string) => void) | null = null;
-  private pagesCache: WikiPageRef[] | null = null;
-  private pagesCacheTime = 0;
-  private readonly PAGES_CACHE_TTL_MS = PAGES_CACHE_TTL_MS;
-  // #164: ingested content-hash snapshot, cached on the same TTL/lifecycle as
-  // pagesCache so back-to-back single-file ingests don't re-walk the vault.
+  // The wiki page index, held per file across calls. Replaces the 5-second TTL
+  // snapshot that every write dropped whole (Issue #662).
+  private pageIndex!: WikiPageIndex;
+  private readonly INGESTED_HASHES_TTL_MS = INGESTED_HASHES_TTL_MS;
+  // #164: ingested content-hash snapshot. This cache owns INGESTED_HASHES_TTL_MS
+  // now, and is still invalidated on every write, so back-to-back single-file
+  // ingests don't re-walk the vault.
   private ingestedHashesCache: Set<string> | null = null;
   private ingestedHashesCacheTime = 0;
   // v1.24.0 Bug A: shared graph cache for PPR — built lazily from loaded page
@@ -228,11 +235,11 @@ export class WikiEngine {
       deleteFile: p => this.deleteFile(p),
       tryReadFile: p => this.tryReadFile(p),
       buildSystemPrompt: task =>
-        buildSystemPrompt(this.settings, t => this.schemaManager.getSchemaContext(t as SchemaTask), task),
+        buildSystemPrompt(this.settings, t => this.schemaManager.getSchemaContext(t as SchemaTask), task, activeVocabularyLists(this.app, this.settings)),
       getSectionLabels: () => getSectionLabels(this.settings),
-      getExistingWikiPages: () =>
-        getExistingWikiPages(this.app, this.settings.wikiFolder),
+      getExistingWikiPages: () => this.getExistingWikiPages(),
       getSchemaContext: t => this.schemaManager.getSchemaContext(t as SchemaTask),
+      getAbortSignal: () => this.abortController?.signal,
       ...(this.subtle ? { subtle: this.subtle } : {}),
       onFileWrite: path => this.onFileWrite?.(path),
       onContradiction: c => this.triageContradictions?.push(c),
@@ -273,6 +280,9 @@ export class WikiEngine {
       return Promise.all(readTasks);
     };
     this.graphCache = new GraphCache({ wikiFolder: this.settings.wikiFolder, loadPages: graphLoader });
+    // The wiki folder is read through a closure: `updateSettings` can change it,
+    // and the index must follow the current one rather than the one at construction.
+    this.pageIndex = new WikiPageIndex(this.app, () => this.settings.wikiFolder);
 
     // v1.25.1 Phase C-PR1: index generator (extracted from inline state in
     // WikiEngine). Reads from app.vault via injected closures; never holds App.
@@ -289,7 +299,11 @@ export class WikiEngine {
       wikiFolder: this.settings.wikiFolder,
       wikiLanguage: this.settings.wikiLanguage ?? '',
       readFile: (path: string) => this.tryReadFile(path),
-      writeFile: (path: string, content: string) => this.createOrUpdateFile(path, content),
+      // #603 slice 2: the log declares its intent instead of inheriting the
+      // full gate. `guard: false` — see `LOG_WRITE_INTENT`: the path-prefix
+      // repair turns this journal's correct page links into dead links.
+      writeFile: (path: string, content: string) =>
+        this.writeFileWithIntent(path, content, LOG_WRITE_INTENT),
     });
   }
 
@@ -344,10 +358,21 @@ export class WikiEngine {
         if (!current) return;
         const flipped = setGenerationComplete(current, true);
         if (flipped === current) return;
-        const file = this.app.vault.getAbstractFileByPath(path);
-        if (file instanceof TFile) {
-          await this.app.vault.process(file, () => flipped);
-        }
+        // #603 slice 3: was `this.app.vault.process(file, () => flipped)`.
+        // The callback discarded its `data` argument and returned a value computed
+        // from an earlier read, so this never had `process`'s atomicity to lose —
+        // it only lacked what `rawWrite` adds: the three-attempt retry and the
+        // NFC/NFD "already exists" recovery for the path.
+        //
+        // `STAMP_WRITE_INTENT` is `create: false`, and that is the point. The
+        // pre-split form resolved a `TFile` first and did nothing when it was
+        // gone, so it could only update. `rawWrite` also creates. This function
+        // is deliberately un-awaited, so it races the cancel cleanup that deletes
+        // the very page it is stamping — and a stamp that can create writes the
+        // page back with `generation_complete: true`, which is the state #582/#583
+        // exist to prevent and which would make every later trigger skip the
+        // source. Update-only, as before.
+        await this.rawWrite(path, flipped, STAMP_WRITE_INTENT);
       } catch (e) {
         console.warn(`[wiki-engine] markPageComplete failed for ${path}:`, e);
       }
@@ -407,8 +432,10 @@ export class WikiEngine {
     this.onLintEnd?.();
   }
 
-  private checkCancelled(): void {
-    if (this.abortController?.signal.aborted) {
+  private checkCancelled(kind: WriteIntent['cancel']): void {
+    if (kind === 'none') return;
+    const controller = kind === 'lint' ? this.lintAbortController : this.abortController;
+    if (controller?.signal.aborted) {
       throw new DOMException('Ingestion cancelled by user', 'AbortError');
     }
   }
@@ -461,14 +488,14 @@ export class WikiEngine {
 
   /**
    * Content hashes already present in the wiki, read from source-page
-   * frontmatter. Cached on the same TTL as pagesCache and invalidated on every
+   * frontmatter. Held for INGESTED_HASHES_TTL_MS and invalidated on every
    * file write (via invalidatePageCaches), so a fresh ingest is always seen on
    * the next call while back-to-back rejected/skip checks reuse one snapshot.
    * The returned set is read-only to callers (only `seen` is mutated per batch).
    */
   private buildIngestedHashes(): Set<string> {
     const now = Date.now();
-    if (this.ingestedHashesCache && (now - this.ingestedHashesCacheTime) < this.PAGES_CACHE_TTL_MS) {
+    if (this.ingestedHashesCache && (now - this.ingestedHashesCacheTime) < this.INGESTED_HASHES_TTL_MS) {
       return this.ingestedHashesCache;
     }
     const hashes = new Set<string>();
@@ -483,9 +510,16 @@ export class WikiEngine {
     return hashes;
   }
 
-  /** Invalidate both write-dependent caches. Called after every vault write/delete. */
-  private invalidatePageCaches(): void {
-    this.pagesCache = null;
+  /**
+   * Invalidate the write-dependent caches. Called after every vault write/delete.
+   *
+   * `path` is the page that changed, when the caller knows it: the index then
+   * drops that one entry instead of everything. Without it — the wiki folder
+   * itself changed — the whole index goes.
+   */
+  private invalidatePageCaches(path?: string): void {
+    if (path === undefined) this.pageIndex.clear();
+    else this.pageIndex.invalidate(path);
     this.ingestedHashesCache = null;
     this.graphCache.invalidate();
   }
@@ -521,7 +555,7 @@ export class WikiEngine {
    * fix-runners. Lint phases call this instead of raw getSchemaContext.
    */
   async buildSystemPrompt(task: SchemaTask): Promise<string | undefined> {
-    return buildSystemPrompt(this.settings, t => this.schemaManager.getSchemaContext(t as SchemaTask), task);
+    return buildSystemPrompt(this.settings, t => this.schemaManager.getSchemaContext(t as SchemaTask), task, activeVocabularyLists(this.app, this.settings));
   }
 
   /**
@@ -865,16 +899,17 @@ export class WikiEngine {
       const dir = file.parent?.path ?? '';
       const rawPath = dir ? `${dir}/${file.basename}.pdf.md` : `${file.basename}.pdf.md`;
       sidecarPath = normalizePath(rawPath);
-      const existing = this.app.vault.getAbstractFileByPath(sidecarPath);
       // v1.25.11 PATCH #169: sidecar-write stage mirror. Fires only when
       // the user has opted in via writePdfMarkdownToVault. ADD-only
       // emission — the vault write itself is unchanged.
       setPdfStage('pdfStageSidecar');
-      if (existing instanceof TFile) {
-        await this.app.vault.modify(existing, conversionResult.markdown);
-      } else {
-        await this.app.vault.create(sidecarPath, conversionResult.markdown);
-      }
+      // #603 slice 2: the prose bypass above is now declared rather than implied.
+      // The sidecar takes `rawWrite` alone — the retry and path resolution every
+      // write wants, without the guard (it is a plain copy of LLM-converted
+      // markdown) and without the notification that could cascade into
+      // auto-ingest. Routing it through the same helper also means the NFC/NFD
+      // "already exists" recovery now applies here.
+      await this.writeFileWithIntent(sidecarPath, conversionResult.markdown, RAW_WRITE_INTENT);
     }
 
     // Altitude #3: duration-driven completion Notice. Below NOTICE_SHORT
@@ -1073,7 +1108,7 @@ export class WikiEngine {
       console.debug(`[Time] Source analysis phase: ${analysisTime}ms`);
       console.debug('Analysis result:', JSON.stringify(analysis, null, 2));
 
-      this.checkCancelled();
+      this.checkCancelled('ingest');
 
       // Issue #514: a candidate the source only mentions gets no page. Decided
       // from the text before any page is planned — a name the note never says,
@@ -1105,7 +1140,7 @@ export class WikiEngine {
         this.settings.skipMentionOnlyCandidates === true &&
         !translated
       ) {
-        const pages = await getExistingWikiPages(this.app, this.settings.wikiFolder);
+        const pages = await this.getExistingWikiPages();
         const table = applyOutcomeTable(
           analysis,
           extractBody(rawSource),
@@ -1198,10 +1233,10 @@ export class WikiEngine {
             analysis.concepts = covered.concepts;
           }
         }
-        // Stage 5 (#568): validation accepts exactly what the declared source
-        // folders and the wiki's own pages carry — new values are born by
-        // tagging a note or a page, not by editing a settings list.
-        domainVocabulary = collectActiveVocabulary(this.app, this.settings);
+        // Stage 5 (#568): validation accepts exactly what the prompt offered —
+        // the one vocabulary of vocabulary.ts (settings list + note tags + page
+        // tags). A value outside it is dropped, not written.
+        domainVocabulary = domainVocabularyOf(this.app, this.settings);
         for (const item of [...analysis.entities, ...analysis.concepts, ...stubPlan.map(s => s.item)]) {
           const selection = selectDomains(item.domains, domainVocabulary);
           if (selection.rejected.length > 0) {
@@ -1286,9 +1321,11 @@ export class WikiEngine {
             normalizePath,
             fileExists: (p) => this.app.vault.getAbstractFileByPath(p) !== null,
             createOrUpdateFile: (p, c) => this.createOrUpdateFile(p, c),
-            // S142: the stub's identity tag faces the harvest like every
-            // other writer's tags (the domains were validated above).
-            vocabulary: collectActiveVocabulary(this.app, this.settings),
+            // S142: the stub's identity tag faces the same list every other
+            // identity writer's tags do (create/merge/related) — the full
+            // vocabulary, not the domains view: `item.type` is an identity
+            // value and may be a flat settings term.
+            vocabulary: activeVocabulary(this.app, this.settings),
           },
           stubPlan,
           sourceSlug,
@@ -1341,7 +1378,7 @@ export class WikiEngine {
         tasks: pageGenTasks,
         concurrency,
         batchDelayMs: batchDelay,
-        checkCancelled: () => this.checkCancelled(),
+        checkCancelled: () => this.checkCancelled('ingest'),
         apiDelay: (ms: number) => this.apiDelay(ms),
         onProgress: (_id) => {
           step++;
@@ -1429,7 +1466,7 @@ export class WikiEngine {
         tasks: relatedTasks,
         concurrency: relatedConcurrency,
         batchDelayMs: relatedDelay,
-        checkCancelled: () => this.checkCancelled(),
+        checkCancelled: () => this.checkCancelled('ingest'),
         apiDelay: (ms: number) => this.apiDelay(ms),
         onProgress: (id) => {
           const task = relatedTasks.find(t => t.id === id);
@@ -1508,6 +1545,7 @@ export class WikiEngine {
         durationSec: Math.round(totalTime / 1000),
         model: this.settings.model,
         sourceBytes: sourceSize,
+        ...(analysis.embedded_image_analysis ? { embeddedImageAnalysis: analysis.embedded_image_analysis } : {}),
       });
       const indexTime = Date.now() - indexStart;
       console.debug(`[Time] Index Index & log update: ${indexTime}ms`);
@@ -1550,6 +1588,7 @@ export class WikiEngine {
         contradictionsFound: triageContradictions.length,
         success: true,
         elapsedSeconds: Math.round(totalTime / 1000),
+        ...(analysis.embedded_image_analysis ? { embeddedImageAnalysis: analysis.embedded_image_analysis } : {}),
         // v1.22.6 #204: Propagate trigger so completion can route UI.
         trigger: opts?.trigger,
       });
@@ -1710,26 +1749,32 @@ export class WikiEngine {
 
     // Issue #114: if the source page already exists with manually-set tags,
     // preserve them — re-ingesting a note must not overwrite corrections.
-    // Priority: existing source-page tags > source-note tags > LLM concept names.
+    // Priority: existing source-page tags > source-note tags > default. A
+    // hand-set nested tag is part of the vocabulary by construction (the
+    // harvest reads `sources/` pages), so it passes the gate below; a flat
+    // value outside the form list is not a legal source-page tag anywhere.
     const existingSource = await this.tryReadFile(path);
     const existingFm = existingSource ? parseFrontmatter(existingSource) : null;
     const existingTags = Array.isArray(existingFm?.tags) && existingFm.tags.length > 0
       ? existingFm.tags
       : null;
 
-    // Issue #90: inherit tags from source note frontmatter when available,
-    // so the generated summary page doesn't pollute the tag vocabulary with
-    // LLM-derived concept names. Source pages use the closed VALID_SOURCE_TAGS
-    // taxonomy, so inherited tags are filtered to it and the documented default
-    // is the last resort — concept names are not a legal value here.
-    const sourceTags = extractSourceTags(content).filter(t =>
-      (VALID_SOURCE_TAGS as readonly string[]).includes(t)
-    );
+    // Issue #90 / one vocabulary: the source page's `tags:` carries two axes.
+    // The form values come from the closed VALID_SOURCE_TAGS list (inherited
+    // from the note when it names any, else the default). The domain axis is
+    // the `Group/Value` view of the vocabulary — not the flat identity types
+    // (`theory`, `person`), which belong to entity and concept pages and are
+    // exactly what the model wrote here instead of `other`. The note's own
+    // domain tags are the seed; the model may add domain values that describe
+    // the summary, and the constraints pass below drops everything else — the
+    // model never mints a term.
+    const vocabulary = domainVocabularyOf(this.app, this.settings);
+    const noteTags = extractSourceTags(content);
+    const formTags = noteTags.filter(t => (VALID_SOURCE_TAGS as readonly string[]).includes(t));
+    const noteDomains = selectDomains(noteTags, vocabulary).kept;
     const tagsValue = existingTags
       ? existingTags.join(', ')
-      : sourceTags.length > 0
-        ? sourceTags.join(', ')
-        : DEFAULT_SOURCE_TAG;
+      : [...(formTags.length > 0 ? formTags : [DEFAULT_SOURCE_TAG]), ...noteDomains].join(', ');
 
     const createdPagesList = plannedPaths.length > 0
       ? plannedPaths.map(p => {
@@ -1744,10 +1789,12 @@ export class WikiEngine {
     const ingestDate = localDateStamp();
     const prompt = renderTemplate(PROMPTS.generateSummaryPage, {
       source_title: analysis.source_title,
-      content: content.substring(0, 500),
+      // The window starts at the body: the note's frontmatter carries the very
+      // tags the seed above already decided about, and shown raw it was copied
+      // back into `tags:` verbatim (4 of 5 vocabulary violations on one vault).
+      content: extractBody(content).substring(0, 500),
       analysis: JSON.stringify(analysis),
       created_pages_list: createdPagesList || '(none)',
-      source_file: file.path,
       date: ingestDate,
       tags: tagsValue,
       constraints: UNIVERSAL_LINK_CONSTRAINTS,
@@ -1764,7 +1811,15 @@ export class WikiEngine {
       ...(this.settings.disableThinking ? { enableThinking: false } : {}),
     });
 
-    const cleanedContent = cleanMarkdownResponse(pageContent);
+    // The same gate the entity and concept pages pass, for the same reason:
+    // the model writes this frontmatter, and until here nothing checked it —
+    // `theory` and copied note tags reached disk. Form values stay legal next
+    // to the vocabulary; `created:` of a re-ingested page is preserved.
+    const cleanedContent = enforceFrontmatterConstraints(cleanMarkdownResponse(pageContent), 'source', this.settings, {
+      pagePath: path,
+      preserveCreated: typeof existingFm?.created === 'string' ? existingFm.created : undefined,
+      domainVocabulary: vocabulary,
+    });
     // #164: stamp a content fingerprint so future ingests can detect duplicates.
     // Injected programmatically — the LLM can't be trusted to emit it.
     let finalContent = upsertFrontmatterField(cleanedContent, 'contentHash', hashBody(extractBody(content)));
@@ -1803,12 +1858,11 @@ export class WikiEngine {
     }
 
     // The alias floor the other two writers of this field already apply.
-    // `resolveMinAliasLength` exists so both of them resolve the same floor
-    // from the same place; this is a third writer that resolved none. The
-    // model's `aliases:` arrive verbatim inside `cleanedContent` and the
-    // curated note aliases merge on top of them, so the filter belongs here,
-    // after both, on the finished list — filtering either input alone leaves
-    // the other unchecked.
+    // `resolveMinAliasLength` exists so all of them resolve the same floor
+    // from the same place. The constraints pass above has already applied it
+    // to the model's list; the curated note aliases merge on top of that, so
+    // the finished list is checked here once more — filtering either input
+    // alone leaves the other unchecked.
     //
     // Rewrites the block only when something is actually dropped: a page
     // whose aliases already pass keeps the bytes the model wrote.
@@ -1846,6 +1900,11 @@ export class WikiEngine {
         maxChars: SOURCE_PAGE_MENTIONS_MAX_CHARS,
       },
     );
+    finalContent = injectEmbeddedImageEvidenceSection(
+      finalContent,
+      this.settings.saveEmbeddedImageEvidence ? analysis.embedded_image_analysis : undefined,
+      getSectionLabels(this.settings).embedded_image_evidence,
+    );
 
     // Stage 4 (#568): the source page no longer mirrors the note's tags into
     // a `domains:` field — one field, and the note itself carries the tags
@@ -1874,7 +1933,71 @@ export class WikiEngine {
     return path;
   }
 
+  /**
+   * How a write reached its result (Issue #603).
+   *
+   * `recovered` is a separate case because the two recovery paths — the
+   * NFC/NFD "already exists" fallback and the exhausted-retries scan — do **not**
+   * stamp the page complete, while the two ordinary paths do. That asymmetry is
+   * preserved deliberately: this slice changes no behaviour, and encoding the
+   * outcome in a return value makes the difference checkable instead of hidden in
+   * two early `return`s. Whether the recovery paths should stamp is a slice-3
+   * decision, not one to make silently here.
+   *
+   * `absent` is the `create: false` outcome: the file was gone and the intent did
+   * not permit writing it back. It is not an error and not a recovery — nothing
+   * happened, on purpose. Named here because `writeFileWithIntent` returns early
+   * on it: the layers after the write are consequences of a write.
+   */
+  private static readonly RECOVERED = 'recovered' as const;
+
+  /**
+   * The `create: false` outcome: the file was gone and the intent did not permit
+   * writing it back. Not an error and not a recovery — nothing happened, on
+   * purpose.
+   *
+   * Both `create: false` intents can produce it: the stamp (`STAMP_WRITE_INTENT`)
+   * and the lint fixers' write (`LINT_WRITE_INTENT`). The lint fixers are the
+   * likelier of the two, because their window contains an LLM call.
+   */
+  private static readonly ABSENT = 'absent' as const;
+
+  /**
+   * The compatibility entry point. Every existing caller already gets the full
+   * gate — `writeFileWithIntent` with `FULL_WRITE_INTENT` — so this shorthand
+   * changes nothing. New callers that want a subset should name it (Issue #603).
+   */
   async createOrUpdateFile(path: string, content: string): Promise<void> {
+    return this.writeFileWithIntent(path, content, FULL_WRITE_INTENT);
+  }
+
+  /**
+   * The write gate, with the layers a caller actually wants.
+   *
+   * Order is unchanged from the single-method form: cancel check, guard, write,
+   * page completion, notification. Only the composition is new.
+   *
+   * Public since #603 slice 3: the lint fixers reach it through
+   * `LintContext.wikiEngine`, which every lint phase already carries, so the
+   * declared-intent entry needs no new interface member anywhere. The `intent`
+   * parameter is required — an optional one would let a call site stay silent,
+   * and silence is what let the bypasses in #603 go unnoticed.
+   *
+   * **A known gap, filed separately rather than fixed here (#763).** Returning
+   * `void` means a caller cannot tell an update from a skip, and a `create: false`
+   * intent can decline. The lint fixers are the ones that would notice — they
+   * report a count and a log line per page, and on a page that vanished during
+   * their LLM call the write is now correctly skipped. Before that skip existed
+   * the report was true because the write always landed; wrongly, but it landed,
+   * so the change moved the defect out of the vault and into the log. Telling the
+   * two apart needs a return value, which is a signature change across every
+   * consumer of `createOrUpdateFile` — review scoped it out of this PR.
+   */
+  async writeFileWithIntent(
+    path: string,
+    content: string,
+    intent: WriteIntent
+  ): Promise<void> {
     // #646: a cancelled ingest stops at the next page write. The abort signal
     // reaches the model call only since the same fix; before, every call ran
     // to its end and the cancel was honoured at three checkpoints per ingest.
@@ -1882,72 +2005,70 @@ export class WikiEngine {
     // Obsidian inside that window skipped #583's cleanup — the summary page
     // stayed, stamped complete, and every later trigger skipped the source.
     // Outside an ingest there is no controller and this is a no-op.
-    this.checkCancelled();
+    //
+    // The controller is named by the intent, not assumed. The engine holds two
+    // — this one for an ingest and `lintAbortController` for a lint run — and
+    // they can overlap, because `lint-wiki` is registered without an
+    // `isIngesting()` guard. Reading the ingest controller here made the lint
+    // fixers' writes stop on the ingest's cancel button and ignore their own.
+    this.checkCancelled(intent.cancel);
     console.debug('createOrUpdateFile:', path);
 
-    // Central pollution detection: strip folder-prefix duplication from wiki-links
-    // before writing. This catches pollution from ALL sources (page generation,
-    // stub expansion, dead link fixes, merges, etc.).
-    //
-    // Pattern A: display-name pollution — [[entities/X|entities/Y]]
-    //   e.g. [[entities/Qwen|entities/Qwen]] → [[entities/Qwen|Qwen]]
-    const DISPLAY_POLLUTION_REGEX = /\[\[(entities|concepts|sources)\/([^|\]]+)\|(entities|concepts|sources)\/([^|\]]+)\]\]/g;
-    if (DISPLAY_POLLUTION_REGEX.test(content)) {
-      console.warn(
-        `createOrUpdateFile: detected display-name pollution in ${path}, auto-correcting`
-      );
-      content = content.replace(
-        DISPLAY_POLLUTION_REGEX,
-        (_match: string, _folder: string, _path: string, _dupFolder: string, display: string) => {
-          return `[[${_folder}/${_path}|${display}]]`;
-        }
-      );
+    const isWikiContentPage = this.isInWikiContentFolder(path, this.settings.wikiFolder);
+
+    if (intent.guard) {
+      const guarded = applyPageGuard(content, {
+        wikiFolder: this.settings.wikiFolder,
+        preserveCase: this.settings.slugCase === 'preserve',
+        isWikiContentPage,
+      });
+      content = guarded.content;
+      // The messages are unchanged from the pre-split form: the guard reports
+      // what it corrected, the engine still says it, so the console looks
+      // identical.
+      if (guarded.corrections.displayNamePollution) {
+        console.warn(
+          `createOrUpdateFile: detected display-name pollution in ${path}, auto-correcting`
+        );
+      }
+      if (guarded.corrections.pathPrefixPollution) {
+        console.warn(
+          `createOrUpdateFile: detected path-prefix pollution in ${path}, auto-correcting`
+        );
+      }
+      if (guarded.corrections.sourcesEntries > 0) {
+        console.warn(`createOrUpdateFile: normalized polluted sources field in ${path}`);
+      }
     }
 
-    // Pattern B: path-prefix duplication — [[X/Xname|name]]
-    //   e.g. [[concepts/concepts布局优化|布局优化]] → [[concepts/布局优化|布局优化]]
-    //   The folder prefix is duplicated in the path portion, directly before
-    //   the page name with no separator (CJK char, letter, etc.).
-    //   Safe: [[concepts/concepts-of-ML|...]] — '-' separator indicates legitimate slug.
-    const PATH_DUP_REGEX = /\[\[(entities|concepts|sources)\/\1([^\s\-_|\]]+)(\|[^\]]+)?\]\]/g;
-    if (PATH_DUP_REGEX.test(content)) {
-      console.warn(
-        `createOrUpdateFile: detected path-prefix pollution in ${path}, auto-correcting`
-      );
-      content = content.replace(
-        PATH_DUP_REGEX,
-        (_match: string, folder: string, rest: string, display: string | undefined) => {
-          const displayPart = display || '';
-          return `[[${folder}/${rest}${displayPart}]]`;
-        }
-      );
-    }
+    const outcome = await this.rawWrite(path, content, intent);
 
-    // Issue #125: normalize the `sources:` frontmatter field on every write.
-    // The LLM emits raw note paths ("[[Notizen/Autonome Dysregulation.md]]"),
-    // `.md` extensions, `|alias` pipes, and space/paren-containing titles. Left
-    // unfixed these become dead links that previously required a post-ingest
-    // cleanup script. normalizeSourcesField (Issue #81) already exists and is
-    // unit-tested but was only wired into the lint/auto-maintain paths — not the
-    // generation/merge write path that produces this pollution in the first place.
-    const preserveCase = this.settings.slugCase === 'preserve';
-    const sourcesFix = fixPollutedSources(content, this.settings.wikiFolder, preserveCase);
-    if (sourcesFix.fixed > 0) {
-      console.warn(`createOrUpdateFile: normalized polluted sources field in ${path}`);
-      content = sourcesFix.content;
-    }
+    // `absent` means nothing was written: the file was gone and this intent may
+    // not create it. The two layers below are consequences of a write, so they
+    // must not run for one that did not happen — `notify` would fire
+    // `onFileWrite` and invalidate caches for an unwritten path, and `guard`
+    // would spawn a completion stamp for a page that is not there. Unreachable
+    // today (no intent pairs `create: false` with either flag), which is exactly
+    // why the next `create: false` intent is where it would have bitten.
+    if (outcome === WikiEngine.ABSENT) return;
 
-    // Cosmetic spacing: one blank line after each heading, blank-line runs
-    // collapsed (see core/markdown-spacing.ts). Wiki content pages only —
-    // log/schema writes pass through untouched.
-    if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
-      content = normalizeHeadingSpacing(content);
-      // Repair the provenance footnote's brackets on the same pass. The model
-      // gets them wrong often enough that paragraph-provenance.ts stops seeing
-      // the marker, and a marker it cannot see is a paragraph with no owner.
-      content = normalizeProvenanceMarkers(content);
+    if (intent.guard && outcome !== WikiEngine.RECOVERED && isWikiContentPage) {
+      this.markPageComplete(path);
     }
+    if (intent.notify) {
+      this.onFileWrite?.(path);
+      this.invalidatePageCaches(path);
+    }
+  }
 
+  /**
+   * Concern 3 of the old gate: retry, path resolution, create-or-update.
+   *
+   * Deliberately knows nothing about wiki pages, pollution or notification — that
+   * is what makes it usable by the PDF sidecar, whose comment at `:845-851` is the
+   * original evidence that one gate for every write was the wrong shape.
+   */
+  private async rawWrite(path: string, content: string, intent: WriteIntent): Promise<string> {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const file = this.app.vault.getAbstractFileByPath(path);
@@ -1955,12 +2076,7 @@ export class WikiEngine {
           console.debug(`Attempt ${attempt + 1}: File exists, updating:`, path);
           await this.app.vault.process(file, () => content);
           console.debug('Update success:', path);
-          if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
-            this.markPageComplete(path);
-          }
-          this.onFileWrite?.(path);
-          this.invalidatePageCaches();
-          return;
+          return 'updated';
         }
 
         // getAbstractFileByPath returned null — could be an NFC/NFD normalization
@@ -1973,25 +2089,25 @@ export class WikiEngine {
             console.debug('createOrUpdateFile: resolved via directory scan:', path);
             await this.app.vault.process(resolved, () => content);
             console.debug('Update success (resolved path):', path);
-            if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
-              this.markPageComplete(path);
-            }
-            this.onFileWrite?.(path);
-            this.invalidatePageCaches();
-            return;
+            return 'updated';
           }
+        }
+
+        if (!intent.create) {
+          // Update-only intent. The NFC/NFD scan above already looked, so the file
+          // is genuinely gone and creating it would bring it back — see
+          // `STAMP_WRITE_INTENT` for why that is a correctness requirement rather
+          // than a preference. Stop here instead of retrying: no attempt of this
+          // loop may create, so none of them would differ.
+          console.debug('rawWrite: file absent and this intent may not create it:', path);
+          return 'absent';
         }
 
         // File genuinely does not appear to exist — attempt to create it.
         console.debug(`Attempt ${attempt + 1}: File not found, creating:`, path);
         await this.app.vault.create(path, content);
         console.debug('Create success:', path);
-        if (this.isInWikiContentFolder(path, this.settings.wikiFolder)) {
-          this.markPageComplete(path);
-        }
-        this.onFileWrite?.(path);
-        this.invalidatePageCaches();
-        return;
+        return 'created';
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         console.error(`Attempt ${attempt + 1} failed:`, errorMsg);
@@ -2010,9 +2126,7 @@ export class WikiEngine {
           if (resolved instanceof TFile) {
             await this.app.vault.process(resolved, () => content);
             console.debug('Update succeeded after file resolution:', path);
-            this.onFileWrite?.(path);
-            this.invalidatePageCaches();
-            return;
+            return 'recovered';
           }
           console.debug('File exists anomaly, retrying after 100ms:', path);
           await new Promise(resolve => window.setTimeout(resolve, 100));
@@ -2037,8 +2151,7 @@ export class WikiEngine {
     if (file) {
       await this.app.vault.process(file, () => content);
       console.debug('Final update succeeded:', path);
-      this.onFileWrite?.(path);
-      this.invalidatePageCaches();
+      return 'recovered';
     } else {
       // Issue #172: localize via getText, never hardcode CJK in source.
       throw new Error(
@@ -2051,7 +2164,7 @@ export class WikiEngine {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFile) {
       await this.app.fileManager.trashFile(file);
-      this.invalidatePageCaches();
+      this.invalidatePageCaches(path);
       console.debug('deleteFile:', path);
     }
   }
@@ -2122,15 +2235,7 @@ export class WikiEngine {
   // ---- Lint-fix delegation ----
 
   getExistingWikiPages(): Promise<WikiPageRef[]> {
-    const now = Date.now();
-    if (this.pagesCache && (now - this.pagesCacheTime) < this.PAGES_CACHE_TTL_MS) {
-      return Promise.resolve(this.pagesCache);
-    }
-    return getExistingWikiPages(this.app, this.settings.wikiFolder).then(data => {
-      this.pagesCache = data;
-      this.pagesCacheTime = Date.now();
-      return data;
-    });
+    return this.pageIndex.pages();
   }
 
   async fixDeadLink(sourcePath: string, targetName: string): Promise<string> {
@@ -2142,7 +2247,7 @@ export class WikiEngine {
   }
 
   // Issue #103: delete empty stubs without running full lint pipeline
-  async deleteEmptyStubs(wikiFolder: string): Promise<{ deleted: number; failed: number; errors: string[] }> {
+  async deleteEmptyStubs(wikiFolder: string): Promise<DeleteEmptyStubsResult> {
     return deleteEmptyStubs(this.ctx, wikiFolder);
   }
 

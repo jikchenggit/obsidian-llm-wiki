@@ -2,7 +2,9 @@
 
 > Feature planning and improvement proposals
 
-**Latest shipped:** v1.27.2 PATCH (2026-09-15, 39 commits / 4144 tests). See [CHANGELOG.md §1.27.2](./CHANGELOG.md#1272---2026-09-15) for the canonical composition record. | **Updated:** 2026-09-15 (v1.27.2 release prep — wave F shipped, incl. the main-is-red regression fix #722)
+**Latest shipped:** v1.27.2 PATCH (2026-09-15, 39 commits / 4144 tests). See [CHANGELOG.md §1.27.2](./CHANGELOG.md#1272---2026-09-15) for the canonical composition record. | **Updated:** 2026-09-16 (**v1.28.0 MINOR planning opened** — design track seeded from the cross-source relation work, issue #729; see the section below)
+
+**Next MINOR candidate:** Issue #608 — opt-in local Markdown-image analysis. The implementation resolves vault-local Obsidian and Markdown image embeds into 20 MiB visual-evidence packages with no per-note image-count limit; individual images stay capped at 10 MiB and GIFs use their first frame. Images carry their nearest Markdown paragraphs for context, and a default-off source-page audit section can retain the resulting evidence. Remote images, OCR, and caching remain out of scope.
 
 **v1.26.5 PATCH CANCELLED 2026-08-19** — folded into v1.27.0 MINOR to amortize release-cycle overhead (per user direction).
 
@@ -13,6 +15,81 @@
 ## Process notes
 
 Process standards live in [AGENTS.md §"🛡️ Six-Gate Quality Closure"](./AGENTS.md#-six-gate-quality-closure). Release flow lives in the [`obsidian-plugin-release` skill](/Users/greener/.pi/skills/obsidian-plugin-release/SKILL.md) (Pi canonical path; legacy alias `/Users/greener/.claude/skills/obsidian-plugin-release/SKILL.md` still works under Claude Code sessions). ROADMAP does not duplicate process standards or shipped-version details — only the **planning decisions** that have not yet shipped. The historical `[CLAUDE.md](./CLAUDE.md)` file is now a pointer stub to `AGENTS.md`; all new content goes in `AGENTS.md`.
+
+---
+
+## v1.28.0 MINOR — Design track
+
+**Opened 2026-09-16.** Two mandates, per user direction: **feature work and hardening run in the same window** — v1.28.0 is not a feature-only release. Design detail for the first item lives in [MEMORY.md §"Design record — cross-source relations"](./MEMORY.md#design-record--cross-source-relations-729-v1280); this section carries only the planning decisions.
+
+> **The live, ROI-ordered task list is [MEMORY.md §"Work list (2026-09-18)"](./MEMORY.md#work-list-2026-09-18--ordered-by-roi).** That file holds the ordering and the reasoning; this one holds the window's scope. When they disagree, MEMORY is the newer document.
+
+### Scope groups
+
+| Group | Items | Why this window |
+|---|---|---|
+| **Cross-source relations** (feature) | **#729** — Related sections are intra-source by construction; reserved budget + co-citation projection + local ranker, with multi-hop query decomposition as companion | MINOR-sized and changes default behaviour, so not PATCH-shaped. Research and design concluded 2026-09-16 |
+| **Write-path hardening** (architecture) | **#603** ✅ closed with **#750** · **#662** ✅ closed with **#757** | Both landed 2026-09-20. The gate is split into `rawWrite` / `pageGuard` / `notify` with a defaultless `WriteIntent`, and the page index is held per file. **This was the gate on #729 Phase 1 and it is open** |
+| **Read-path behaviour** (architecture) | **#664** (Related lists grow ~2 entries per source and are never pruned), **#677** (a classification move makes untouched notes read as edited), **#668** (settings tab: three tabs over nine sections that already exist) | Behaviour/UX changes rather than defects |
+| **Deferred features** | **#701** (source-note `wiki-ingested:` marker — contradicts the `README.md:114` promise in all eleven locales), **#741** (`opencode.ai` fails the CORS preflight, so streamed answers arrive buffered), PR **#728** (`@ai-sdk/openai-compatible` 2→3 MAJOR, request-body shape) | Each needs a decision, or carries a measured caveat this pass did not settle |
+| **Community** | **#608** + PR **#687** (local Markdown image embeds) · **#752** (the settings tab also jumps back to the top — the sibling of #668, and fixing the scroll before #668's restructure means doing it twice) | Already on the milestone |
+
+### Landed outside this window, and worth noting
+
+**#751** sits on `v1.27.x PATCH` rather than here, deliberately: it is one line in
+`esbuild.config.mjs` and it repairs two shipped features (Codex browser login, and the
+desktop streaming transport from #746 that never loaded). **#753 is the same defect
+fixed at the call sites and is an alternative, not a companion** — the reasoning, and
+the check that #751's global flag only affects the two `node:` imports, are in
+MEMORY's work list. **Decide one, not both.**
+
+### Merged into v1.28.0 so far (unreleased)
+
+Recorded here, not in CHANGELOG — that entry is written once at release. Detail on
+what each change settled lives in MEMORY.
+
+- **#736** — custom request headers, the `opencode` preset, a `(Responses)` variant.
+  Closes **#723** and **#735**; both verified end to end by @aisahpA on a real vault
+  with a real Go key, and three defects he found in the PR's own code were fixed
+  before merge.
+- **#739** — **#729 Phase 0**: the Related and extraction ceilings centralised into
+  `src/constants.ts`, behaviour-identical and proven by zero snapshot churn.
+- **#733** — zod 4 migration (**#669**), proven by byte-identical wire snapshots.
+- **#737** + **#734** — AGENTS.md process rules.
+
+### Ordering decision (2026-09-16)
+
+**Hardening before the reader — done.** #603's contract now holds and #662's index is held per file, so the store the acceptance criteria read from is telling the truth. **#729 Phase 1 is unblocked as of 2026-09-20.**
+
+The four review rounds #750 took are the part worth carrying forward: the slice shipped **two behaviour regressions of its own** despite passing all three of its mutations, and the second of the two was a check it *removed* that had been incidentally holding another door shut. Both findings came from @DocTpoint reading the tree rather than the description.
+
+**The write-path design pass completed 2026-09-16 and opens the phase-2/3 gate.** Its recommendation: split the gate into `rawWrite` / `pageGuard` / `notify` rather than funnel every write through it — **five real violations in four files** to fix, plus five sites that only need to declare their intent. Both source issues were re-measured and **each contained one claim that does not hold** (`log-writer.ts` does go through the gate; `contradictions.ts` does not exist), and each omitted worse sites than it listed — including `vault.adapter.write`, which sits below Obsidian's own eventing. Corrected counts and the reasoning are in the MEMORY design record, which phase 2 consumes directly.
+
+Within #729 the mechanisms are ordered **floor-first**: the model-independent mechanism that holds the graph's quality *floor* (co-citation projection over links the vault already has) precedes the model-dependent ones that could raise its *ceiling*. Rationale, the three-mechanism table and the budget tiers are in the MEMORY design record; the principle itself is now a canonical decision (MEMORY §"Key design decisions").
+
+### Phase schedule (2026-09-16)
+
+Dependency-ordered, not priority-ordered. Phase 1 and phase 4 are parallelisable; phase 2 is a chain.
+
+| Phase | Items | Blocked by |
+|---|---|---|
+| **1 — decouple, take the cheap wins** | **#669** ✅ zod 4 · **#723** ✅ custom headers, OpenCode preset, Responses variant (also closed #735) · **#603 + #662 design pass** ✅ — **complete**, see MEMORY §"Design record — write path and page index" | **nothing — done** |
+| **2 — #729 itself** | the six sub-phases in MEMORY §"Implementation plan". **Sub-phase 0 (centralise the ceilings) — ✅ done 2026-09-17** (behaviour-identical, proven by zero snapshot churn); **sub-phase 1 is next — it is the head of the queue** | **nothing — #603 closed 2026-09-20** |
+| **3 — behaviour layer** | **#664 together with #729's allocation** · **#677** (unblocked with #603) · **#668 after #729's toggle has a home** | phase 2 |
+| **4 — independent features** | **#701** (needs its design decision first) · **#608 + PR #687** · **PR #728** (MAJOR `@ai-sdk/openai-compatible` — verify the request-body shape, and **not last in the window**, so fallout has room) | nothing |
+
+**Two couplings found during the 2026-09-16 planning pass, now binding:**
+
+- **#729 ↔ #664.** #729 *adds* Related entries; #664 says those lists already grow ~2 per source and are never pruned. Designed separately, one raises the ceiling while the other leaves the floor open — and the measurement that would catch it (Related length over a rebuild) is exactly the one each would blame the other for. **They ship together.**
+- **#729 ↔ #668.** #729 introduces a settings toggle that defaults on; #668 restructures the settings tab. Land the toggle *after* #668's structure is settled, or it gets re-homed twice. Per the Settings-panel scope rule it is bottom-Advanced-panel either way (content-generation behaviour, not LLM sampling).
+
+**Scheduling gap closed 2026-09-16:** PR **#728** (the MAJOR bump that superseded #706 — which was closed still carrying this milestone) and Issue **#725** + PR **#726** were unassigned. They now sit on `v1.28.0 MINOR` and `v1.27.x PATCH` respectively.
+
+### Open decisions
+
+- Whether #729's co-citation projection runs at **write time** (edges persist, PPR gets cross-source reach for free) or **query time** (no format change, A/B-able without a rebuild).
+- **Reserved vs additive** cross-source allocation — see #729 §"Open questions".
+- Where #729's toggle lands: content-generation behaviour belongs in the bottom Advanced panel per the Settings-panel scope rule, but this should be fixed before code, not after.
 
 ---
 
@@ -118,7 +195,7 @@ Composition record: [CHANGELOG §1.27.2](./CHANGELOG.md#1272---2026-09-15) — 3
 |---|-------|------|---------|-------|--------|
 | 1 | **#568** | Domain-axis write side follow-ups (post-#569-merge) | #91 read-side prerequisite; PR #569 MERGED 09-04 (`9d6183c`), gate table #607 MERGED 09-04 (`6a5ba34`) — remaining work is follow-ups on the merged base, not re-review | DocTpoint | Merged base; file follow-up issues as needed |
 | 2 | **#567** | `customEntityLimit` / `customConceptLimit` ceiling-vs-denominator coupling reduces yield as limit rises | Real user pain (11-50 default range); recommended contract: ceiling-only + stop gets own signal sibling to `checkEmptyBatch` | green-dalii (owner-self) | Issue open; needs contract decision then PR; #607's gate table addresses part of it |
-| 3 | **#603** | "single write gate" contract does not hold — six writers bypass `createOrUpdatePage` | Design call (09-02 reply): narrow documented contract + progressive funnel + write-audit logging | DocTpoint | Open; design decision pending |
+| 3 | **#603** | "single write gate" contract does not hold — six writers bypass `createOrUpdatePage` | Design call (09-02 reply): narrow documented contract + progressive funnel + write-audit logging | DocTpoint | ✅ **CLOSED 2026-09-20** — landed as #750 after four review rounds; slices 1–3 shipped |
 | 4 | **#604** | contradiction resolution loop dead code — nothing sets `review_ok` | Design call (09-02 reply): remove dead branch, keep review field on record | DocTpoint | Open; design decision pending |
 | 5 | **#592 / #593 / #594 / #597** | Jan-Heldal community bug series (dead-link clobber / modal crash / log voice / schema metadata) | Verified against bundled main.js by DocTpoint; submitter invited to PR | Jan-Heldal | Open; awaiting contributor PRs |
 | 6 | **#542** | `isSourceBorneLoop` suppresses halve-retry for common-word degenerate cases | Reaffirmed by #525 follow-up review | green-dalii (owner-self) | Issue open; small fix |

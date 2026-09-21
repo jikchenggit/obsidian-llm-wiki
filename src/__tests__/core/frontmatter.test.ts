@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { LLMWikiSettings } from '../../types';
-import { enforceFrontmatterConstraints, isBlankSource, mergeFrontmatter, mergeFrontmatterArrayField, parseFrontmatter, preserveFrontmatterReviewTag, replaceFrontmatterArrayField, serializeFrontmatter, upsertFrontmatterField } from '../../core/frontmatter';
+import { enforceFrontmatterConstraints, isBlankSource, mergeFrontmatter, mergeFrontmatterArrayField, normalizeFrontmatterOpening, parseFrontmatter, preserveFrontmatterReviewTag, replaceFrontmatterArrayField, serializeFrontmatter, upsertFrontmatterField } from '../../core/frontmatter';
 import { localDateStamp } from '../../core/format';
 
 describe('isBlankSource', () => {
@@ -51,6 +51,73 @@ describe('upsertFrontmatterField', () => {
     expect(parseFrontmatter(result)?.contentHash).toBe('5-1a2b3c4d');
   });
 });
+describe('normalizeFrontmatterOpening', () => {
+  it('strips a leading BOM before ---', () => {
+    const result = normalizeFrontmatterOpening('\uFEFF---\ntype: entity\n---\nBody');
+    expect(result).toBe('---\ntype: entity\n---\nBody');
+  });
+
+  it('strips leading whitespace/blank lines before ---', () => {
+    const result = normalizeFrontmatterOpening('  \n\n---\ntype: entity\n---\nBody');
+    expect(result).toBe('---\ntype: entity\n---\nBody');
+  });
+
+  it('fixes a first line of the wrong dash count (too few or too many) to ---', () => {
+    expect(normalizeFrontmatterOpening('--\ntype: entity\n---\nBody')).toBe('---\ntype: entity\n---\nBody');
+    expect(normalizeFrontmatterOpening('----\ntype: entity\n---\nBody')).toBe('---\ntype: entity\n---\nBody');
+  });
+
+  it('fixes a BOM, leading whitespace, and wrong dash count all at once', () => {
+    const result = normalizeFrontmatterOpening('\uFEFF  \n----\ntype: entity\n---\nBody');
+    expect(result).toBe('---\ntype: entity\n---\nBody');
+  });
+
+  it('returns content completely unchanged when it already starts with ---', () => {
+    const input = '---\ntype: entity\n---\nBody';
+    expect(normalizeFrontmatterOpening(input)).toBe(input);
+  });
+
+  it('returns content unchanged when the first line is not dash-only at all', () => {
+    const input = '# Just a body\n';
+    expect(normalizeFrontmatterOpening(input)).toBe(input);
+  });
+
+  it('returns a valid CRLF-terminated opening completely unchanged', () => {
+    const input = '---\r\nversion: 1\r\n---\r\nBody';
+    expect(normalizeFrontmatterOpening(input)).toBe(input);
+  });
+
+  it('fixes a malformed CRLF opening while preserving the CRLF line ending', () => {
+    const result = normalizeFrontmatterOpening('--\r\nversion: 1\r\n---\r\nBody');
+    expect(result).toBe('---\r\nversion: 1\r\n---\r\nBody');
+  });
+
+  it('leaves a Markdown thematic break alone', () => {
+    // `----` is both a wrong dash count and a horizontal rule, and the first line
+    // alone cannot tell them apart. Repairing the rule hands `parseFrontmatter`
+    // the next `---` in the document, so it parses a "frontmatter" block that
+    // begins in the middle of the prose — and `bumpSchemaMetadata` then writes
+    // `updated:` and `auto_suggestion_count:` into the body. Guard: a damaged
+    // opening is only repaird when a YAML key follows it (review, 2026-09-14).
+    const input = '----\n\n## Extraction\n\nSome prose.\n\n---\n\n## Merge\n';
+    expect(normalizeFrontmatterOpening(input)).toBe(input);
+  });
+
+  it('still repairs a wrong dash count when a YAML key follows it', () => {
+    // The guard must not cost the case the function exists for.
+    expect(normalizeFrontmatterOpening('----\ntype: entity\n---\nBody')).toBe('---\ntype: entity\n---\nBody');
+    expect(normalizeFrontmatterOpening('--\nversion: 1\n---\nBody')).toBe('---\nversion: 1\n---\nBody');
+  });
+
+  it('returns the original content, not the trimmed one, when it does not repair', () => {
+    // `trimStart()` used to run before the decision, so a document with no
+    // frontmatter at all lost its leading blank lines as a side effect of asking
+    // the question.
+    const input = '\n\n# Config\n\nText.\n';
+    expect(normalizeFrontmatterOpening(input)).toBe(input);
+  });
+});
+
 describe('parseFrontmatter', () => {
   it('returns null for content without frontmatter', () => {
     expect(parseFrontmatter('# Just a heading\nSome content')).toBeNull();
@@ -1205,5 +1272,40 @@ describe('mergeFrontmatterArrayField after a full strip (S140)', () => {
     const result = mergeFrontmatterArrayField(content, 'tags', ['Thema/Pathophysiologie']);
     expect(result).toContain('Thema/Pathophysiologie');
     expect(result).not.toContain('- ""');
+  });
+});
+
+describe('enforceFrontmatterConstraints: source pages carry the form list next to the vocabulary', () => {
+  const page = (tags: string) => [
+    '---',
+    'type: source',
+    `tags: [${tags}]`,
+    'source_file: "[[Notizen/X.md]]"',
+    '---',
+    '',
+    '# X - Summary',
+  ].join('\n');
+
+  it('keeps a form value and a vocabulary value, drops the model\'s third option', () => {
+    // `theory` is what the summary model wrote on one vault instead of `other`
+    // — a built-in concept type, legal nowhere on a source page.
+    const out = enforceFrontmatterConstraints(page('other, theory, Thema/Schlaf, Thema/Erfunden'), 'source', undefined, {
+      domainVocabulary: ['Thema/Schlaf'],
+    });
+    expect(out).toMatch(/^tags: \[other, Thema\/Schlaf\]$/m);
+    expect(out).not.toContain('theory');
+    expect(out).not.toContain('Thema/Erfunden');
+  });
+
+  it('keeps the unknown source-page fields through the pass', () => {
+    const out = enforceFrontmatterConstraints(page('other'), 'source', undefined, { domainVocabulary: [] });
+    expect(out).toMatch(/^source_file: "\[\[Notizen\/X\.md\]\]"$/m);
+    expect(out).toMatch(/^type: source$/m);
+  });
+
+  it('a form value is not legal on an entity page', () => {
+    const entity = '---\ntype: entity\ntags: [paper, Sorte/Erkrankung]\n---\n\n# X';
+    const out = enforceFrontmatterConstraints(entity, 'entity', undefined, { domainVocabulary: ['Sorte/Erkrankung'] });
+    expect(out).toMatch(/^tags: \[Sorte\/Erkrankung\]$/m);
   });
 });

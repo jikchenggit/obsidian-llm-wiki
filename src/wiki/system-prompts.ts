@@ -2,7 +2,9 @@
 // Pure functions with no Obsidian vault dependencies.
 
 import { LLMWikiSettings, WIKI_LANGUAGES, ExtractionGranularity } from '../types';
+import { CUSTOM_EXTRACTION_LIMIT_DEFAULT, EXTRACTION_LIMITS } from '../constants';
 import { getActiveEntityTags, getActiveConceptTags } from '../core/tag-vocab';
+import type { VocabularyLists } from '../core/vocabulary';
 
 export function buildWikiLanguageDirective(settings: LLMWikiSettings): string {
   const lang = settings.wikiLanguage || 'en';
@@ -21,7 +23,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: 'Key Concepts', main_points: 'Main Points',
     new_claim: 'New Claim',
     existing_knowledge: 'Existing Knowledge', resolution_suggestion: 'Resolution Suggestion',
-    source_page: 'Source Page', related_pages: 'Related Pages', updated: 'Updated',
+    source_page: 'Source Page', related_pages: 'Related Pages', updated: 'Updated', embedded_image_evidence: 'Embedded Image Visual Evidence',
   },
   zh: {
     basic_information: '基本信息', description: '描述',
@@ -33,7 +35,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: '关键概念', main_points: '要点',
     new_claim: '新主张',
     existing_knowledge: '已有知识', resolution_suggestion: '解决建议',
-    source_page: '来源页面', related_pages: '相关页面', updated: '更新于',
+    source_page: '来源页面', related_pages: '相关页面', updated: '更新于', embedded_image_evidence: '内嵌图片视觉证据',
   },
   // v1.22.0: Traditional Chinese (zh-Hant) for HK/MO/TW/MY/SG users
   'zh-Hant': {
@@ -46,7 +48,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: '關鍵概念', main_points: '要點',
     new_claim: '新主張',
     existing_knowledge: '已有知識', resolution_suggestion: '解決建議',
-    source_page: '來源頁面', related_pages: '相關頁面', updated: '更新於',
+    source_page: '來源頁面', related_pages: '相關頁面', updated: '更新於', embedded_image_evidence: '內嵌圖片視覺證據',
   },
   ja: {
     basic_information: '基本情報', description: '説明',
@@ -58,7 +60,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: '主要概念', main_points: '要点',
     new_claim: '新しい主張',
     existing_knowledge: '既存の知識', resolution_suggestion: '解決案',
-    source_page: 'ソースページ', related_pages: '関連ページ', updated: '更新日',
+    source_page: 'ソースページ', related_pages: '関連ページ', updated: '更新日', embedded_image_evidence: '埋め込み画像の視覚的証拠',
   },
   ko: {
     basic_information: '기본 정보', description: '설명',
@@ -70,7 +72,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: '주요 개념', main_points: '주요 사항',
     new_claim: '새 주장',
     existing_knowledge: '기존 지식', resolution_suggestion: '해결 제안',
-    source_page: '출처 페이지', related_pages: '관련 페이지', updated: '업데이트',
+    source_page: '출처 페이지', related_pages: '관련 페이지', updated: '업데이트', embedded_image_evidence: '포함된 이미지 시각 증거',
   },
   de: {
     basic_information: 'Grundlegende Informationen', description: 'Beschreibung',
@@ -82,7 +84,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: 'Wichtige Konzepte', main_points: 'Hauptpunkte',
     new_claim: 'Neue Behauptung',
     existing_knowledge: 'Bestehendes Wissen', resolution_suggestion: 'Lösungsvorschlag',
-    source_page: 'Quellseite', related_pages: 'Verwandte Seiten', updated: 'Aktualisiert',
+    source_page: 'Quellseite', related_pages: 'Verwandte Seiten', updated: 'Aktualisiert', embedded_image_evidence: 'Visuelle Evidenz eingebetteter Bilder',
   },
   fr: {
     basic_information: 'Informations de base', description: 'Description',
@@ -94,7 +96,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: 'Concepts clés', main_points: 'Points principaux',
     new_claim: 'Nouvelle affirmation',
     existing_knowledge: 'Connaissances existantes', resolution_suggestion: 'Suggestion de résolution',
-    source_page: 'Page source', related_pages: 'Pages associées', updated: 'Mis à jour',
+    source_page: 'Page source', related_pages: 'Pages associées', updated: 'Mis à jour', embedded_image_evidence: 'Preuves visuelles des images intégrées',
   },
   es: {
     basic_information: 'Información básica', description: 'Descripción',
@@ -106,7 +108,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: 'Conceptos clave', main_points: 'Puntos principales',
     new_claim: 'Nueva afirmación',
     existing_knowledge: 'Conocimiento existente', resolution_suggestion: 'Sugerencia de resolución',
-    source_page: 'Página de origen', related_pages: 'Páginas relacionadas', updated: 'Actualizado',
+    source_page: 'Página de origen', related_pages: 'Páginas relacionadas', updated: 'Actualizado', embedded_image_evidence: 'Evidencia visual de imágenes incrustadas',
   },
   pt: {
     basic_information: 'Informações básicas', description: 'Descrição',
@@ -118,7 +120,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: 'Conceitos principais', main_points: 'Pontos principais',
     new_claim: 'Nova afirmação',
     existing_knowledge: 'Conhecimento existente', resolution_suggestion: 'Sugestão de resolução',
-    source_page: 'Página de origem', related_pages: 'Páginas relacionadas', updated: 'Atualizado',
+    source_page: 'Página de origem', related_pages: 'Páginas relacionadas', updated: 'Atualizado', embedded_image_evidence: 'Evidências visuais de imagens incorporadas',
   },
   it: {
     basic_information: 'Informazioni di base', description: 'Descrizione',
@@ -130,7 +132,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: 'Concetti chiave', main_points: 'Punti principali',
     new_claim: 'Nuova affermazione',
     existing_knowledge: 'Conoscenza esistente', resolution_suggestion: 'Suggerimento di risoluzione',
-    source_page: 'Pagina sorgente', related_pages: 'Pagine correlate', updated: 'Aggiornato',
+    source_page: 'Pagina sorgente', related_pages: 'Pagine correlate', updated: 'Aggiornato', embedded_image_evidence: 'Evidenza visiva delle immagini incorporate',
   },
   // v1.26.0: Russian (ru) section labels
   ru: {
@@ -143,7 +145,7 @@ export const SECTION_LABELS: Record<string, Record<string, string>> = {
     key_concepts: 'Ключевые концепции', main_points: 'Основные пункты',
     new_claim: 'Новое утверждение',
     existing_knowledge: 'Существующее знание', resolution_suggestion: 'Предложение по разрешению',
-    source_page: 'Страница-источник', related_pages: 'Связанные страницы', updated: 'Обновлено',
+    source_page: 'Страница-источник', related_pages: 'Связанные страницы', updated: 'Обновлено', embedded_image_evidence: 'Визуальные свидетельства встроенных изображений',
   },
 };
 
@@ -192,22 +194,15 @@ const GRANULARITY_INSTRUCTIONS: Record<ExtractionGranularity, string> = {
   custom: '', // placeholder — never used; getGranularityInstruction handles custom dynamically
 };
 
-// Numeric limits for entity/concept generation in fix (non-ingestion) contexts.
-// Keyed by granularity: max per type (entities, concepts).
-// custom is handled dynamically in getGranularityFixLimits.
-const GRANULARITY_FIX_LIMITS: Record<ExtractionGranularity, { maxEntities: number; maxConcepts: number }> = {
-  fine:     { maxEntities: 6, maxConcepts: 6 },
-  standard: { maxEntities: 3, maxConcepts: 3 },
-  coarse:   { maxEntities: 2, maxConcepts: 2 },
-  minimal:  { maxEntities: 1, maxConcepts: 2 },
-  custom:   { maxEntities: 0, maxConcepts: 0 }, // placeholder — never used
-};
+// Numeric limits for entity/concept generation live in `src/constants.ts`
+// (`EXTRACTION_LIMITS`, `CUSTOM_EXTRACTION_LIMIT_DEFAULT`) since #729 Phase 0.
+// They are read below by the two functions that used to own a private copy.
 
 export function getGranularityInstruction(settings: LLMWikiSettings): string {
   const granularity = settings.extractionGranularity || 'standard';
   if (granularity === 'custom') {
-    const entityLimit = settings.customEntityLimit ?? 5;
-    const conceptLimit = settings.customConceptLimit ?? 5;
+    const entityLimit = settings.customEntityLimit ?? CUSTOM_EXTRACTION_LIMIT_DEFAULT;
+    const conceptLimit = settings.customConceptLimit ?? CUSTOM_EXTRACTION_LIMIT_DEFAULT;
     return `Extract at most ${entityLimit} entities and at most ${conceptLimit} concepts from the source. If you reach either limit, stop extracting that type.`;
   }
   return GRANULARITY_INSTRUCTIONS[granularity] || GRANULARITY_INSTRUCTIONS.standard;
@@ -223,11 +218,11 @@ export function getGranularityFixLimits(settings: LLMWikiSettings): { maxEntitie
   const granularity = settings.extractionGranularity || 'standard';
   if (granularity === 'custom') {
     return {
-      maxEntities: settings.customEntityLimit ?? 5,
-      maxConcepts: settings.customConceptLimit ?? 5
+      maxEntities: settings.customEntityLimit ?? CUSTOM_EXTRACTION_LIMIT_DEFAULT,
+      maxConcepts: settings.customConceptLimit ?? CUSTOM_EXTRACTION_LIMIT_DEFAULT
     };
   }
-  return GRANULARITY_FIX_LIMITS[granularity] || GRANULARITY_FIX_LIMITS.standard;
+  return EXTRACTION_LIMITS[granularity] || EXTRACTION_LIMITS.standard;
 }
 
 export function applySectionLabels(prompt: string, settings: LLMWikiSettings): string {
@@ -242,7 +237,8 @@ export function applySectionLabels(prompt: string, settings: LLMWikiSettings): s
 export async function buildSystemPrompt(
   settings: LLMWikiSettings,
   getSchemaContext: (task: string) => Promise<string | undefined>,
-  task: string
+  task: string,
+  vocabulary?: VocabularyLists
 ): Promise<string | undefined> {
   const parts: string[] = [];
   const langDirective = buildWikiLanguageDirective(settings);
@@ -255,7 +251,11 @@ export async function buildSystemPrompt(
   // caller's responsibility — schema bodies produced by
   // buildDefaultSchemaBody() no longer contain a baked enum to duplicate
   // against.
-  const tagVocab = buildActiveTagVocabularySection(settings);
+  // One vocabulary (vocabulary.ts): callers with an `App` pass the harvested
+  // lists, so the model is offered exactly what the write gate lets through.
+  // Without them the settings list alone is rendered — the shape a caller
+  // without vault access (tests, the CLI shim's early paths) has always seen.
+  const tagVocab = buildActiveTagVocabularySection(settings, vocabulary);
   if (tagVocab) parts.push(tagVocab);
 
   return parts.length > 0 ? parts.join('\n\n') : undefined;
@@ -274,10 +274,11 @@ export async function buildSystemPrompt(
  * language.
  */
 export function buildActiveTagVocabularySection(
-  settings: LLMWikiSettings
+  settings: LLMWikiSettings,
+  vocabulary?: VocabularyLists
 ): string {
-  const entities = getActiveEntityTags(settings);
-  const concepts = getActiveConceptTags(settings);
+  const entities = vocabulary?.entities ?? getActiveEntityTags(settings);
+  const concepts = vocabulary?.concepts ?? getActiveConceptTags(settings);
   const lines: string[] = [];
   lines.push('## Active Tag Vocabulary (runtime)');
   lines.push('');
@@ -293,6 +294,10 @@ export function buildActiveTagVocabularySection(
   lines.push('');
   lines.push(
     'If a discovered item does not clearly fit any of the above, choose the closest match. Do NOT emit a free-form type string — the frontmatter validator will reject it.'
+  );
+  lines.push('');
+  lines.push(
+    'Source pages: `tags:` keeps its form value (paper, article, book, transcript, clippings, notes, other) and may add Group/Value tags from the lists above that describe what the source is about. Nothing else — no entity or concept type.'
   );
   return lines.join('\n');
 }

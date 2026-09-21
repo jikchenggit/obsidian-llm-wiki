@@ -137,7 +137,7 @@ export type QueryViewValue = z.infer<typeof QueryViewValueSchema>;
 
 // ============================================================================
 // v1.26.3 PATCH expanded scope — schemas for the remaining 11 callers
-// (commits 2-11). All schemas use `.passthrough()` per the user's
+// (commits 2-11). All schemas use a loose object (`z.object({...}).loose()`, `zod` 4) per the user's
 // "针对一些格式内容多变的属性，必须留好冗余空间" requirement: an LLM
 // that emits an extra field (e.g. `confidence`, `score`) won't fail
 // validation. Optional fields are marked `.optional()` so models can
@@ -162,13 +162,15 @@ export type QueryViewValue = z.infer<typeof QueryViewValueSchema>;
  * Making them required on Tier 0 would turn a single entity missing one
  * field into a whole-response `NoObjectGeneratedError` → repair roundtrip.
  */
+// `source_path`, `source_slug` and `extracted_at` are not declared (#679):
+// `fillMentionsWithProvenance` stamps all three, and a declared property is a
+// request — the `json_schema_strict` tier lists every property in `required`,
+// so the model had to emit them on every quote after the prompt stopped asking.
+// `.loose()` still lets a model that sends them through on the plain tier.
 const MentionWithProvenanceItem = z.object({
   quote: z.string().optional(),
   translation: z.string().optional(),
-  source_path: z.string().optional(),
-  source_slug: z.string().optional(),
-  extracted_at: z.string().optional(),
-}).passthrough();
+}).loose();
 
 const EntityItem = z.object({
   name: z.string(),
@@ -183,7 +185,7 @@ const EntityItem = z.object({
   // a missing value is not a signal (see CandidateCoverage in types.ts).
   coverage: z.string().optional(),
   domains: z.array(z.string()).optional(),
-}).passthrough();
+}).loose();
 
 const ConceptItem = z.object({
   name: z.string(),
@@ -196,7 +198,7 @@ const ConceptItem = z.object({
   related_entities: z.array(z.string()).optional(),
   coverage: z.string().optional(), // domain axis stage 3 (#568), as on EntityItem
   domains: z.array(z.string()).optional(),
-}).passthrough();
+}).loose();
 
 export const SourceAnalysisLLMSchema = z.object({
   source_title: z.string().optional(),
@@ -210,7 +212,7 @@ export const SourceAnalysisLLMSchema = z.object({
   // `strict: true` had nothing to enforce. `normalizeBatchResponse`
   // then reported 'unusable' on round 1 and abort.
   //
-  // Fix: drop `.optional()` on these two arrays. `.passthrough()` at
+  // Fix: drop `.optional()` on these two arrays. `.loose()` at
   // the top level is preserved, so models that emit extras like
   // `confidence` or `score` still parse — the user requirement
   // "针对一些格式内容多变的属性，必须留好冗余空间" is honored. Only
@@ -230,7 +232,7 @@ export const SourceAnalysisLLMSchema = z.object({
   concepts: z.array(ConceptItem),
   related_pages: z.array(z.string()).optional(),
   key_points: z.array(z.string()).optional(),
-}).passthrough();
+}).loose();
 export type SourceAnalysisLLM = z.infer<typeof SourceAnalysisLLMSchema>;
 
 /**
@@ -241,7 +243,7 @@ export type SourceAnalysisLLM = z.infer<typeof SourceAnalysisLLMSchema>;
  */
 export const LemmaClassifyLLMSchema = z.object({
   kind: z.string(),
-}).passthrough();
+}).loose();
 export type LemmaClassifyLLM = z.infer<typeof LemmaClassifyLLMSchema>;
 
 /**
@@ -253,7 +255,7 @@ export type LemmaClassifyLLM = z.infer<typeof LemmaClassifyLLMSchema>;
  */
 export const TypeRepairLLMSchema = z.object({
   type: z.string(),
-}).passthrough();
+}).loose();
 export type TypeRepairLLM = z.infer<typeof TypeRepairLLMSchema>;
 
 /**
@@ -264,7 +266,7 @@ export type TypeRepairLLM = z.infer<typeof TypeRepairLLMSchema>;
  */
 export const ConversationDedupStatusLLMSchema = z.object({
   status: z.string().optional(),
-}).passthrough();
+}).loose();
 export type ConversationDedupStatusLLM = z.infer<typeof ConversationDedupStatusLLMSchema>;
 
 /**
@@ -278,8 +280,8 @@ export const DedupResultLLMSchema = z.object({
     target: z.string(),
     source: z.string(),
     reason: z.string(),
-  }).passthrough()).optional(),
-}).passthrough();
+  }).loose()).optional(),
+}).loose();
 export type DedupResultLLM = z.infer<typeof DedupResultLLMSchema>;
 
 /**
@@ -292,7 +294,7 @@ export const SchemaSuggestionLLMSchema = z.object({
   changes_needed: z.boolean().optional(),
   new_schema_body: z.string().optional(),
   suggestions: z.string().optional(),
-}).passthrough();
+}).loose();
 export type SchemaSuggestionLLM = z.infer<typeof SchemaSuggestionLLMSchema>;
 
 /**
@@ -312,7 +314,7 @@ export const PathResolutionLLMSchema = z.object({
   // referent. Optional: only consumed when cross-folder candidates were
   // seeded and the matched page's classification is not yet confirmed.
   classification: z.enum(['entity', 'concept']).optional(),
-}).passthrough();
+}).loose();
 export type PathResolutionLLM = z.infer<typeof PathResolutionLLMSchema>;
 
 /**
@@ -323,7 +325,7 @@ export type PathResolutionLLM = z.infer<typeof PathResolutionLLMSchema>;
  */
 export const AliasGenerationLLMSchema = z.object({
   aliases: z.array(z.string()).optional(),
-}).passthrough();
+}).loose();
 export type AliasGenerationLLM = z.infer<typeof AliasGenerationLLMSchema>;
 
 /**
@@ -334,7 +336,7 @@ export type AliasGenerationLLM = z.infer<typeof AliasGenerationLLMSchema>;
  */
 export const TagFixLLMSchema = z.object({
   tags: z.array(z.string()).optional(),
-}).passthrough();
+}).loose();
 export type TagFixLLM = z.infer<typeof TagFixLLMSchema>;
 
 /**
@@ -345,5 +347,18 @@ export type TagFixLLM = z.infer<typeof TagFixLLMSchema>;
  */
 export const WelcomeTranslationLLMSchema = z.object({
   translated: z.string(),
-}).passthrough();
+}).loose();
 export type WelcomeTranslationLLM = z.infer<typeof WelcomeTranslationLLMSchema>;
+
+/** Factual evidence extracted from one bounded package of embedded images. */
+export const EmbeddedImageEvidenceSchema = z.object({
+  images: z.array(z.object({
+    index: z.number(),
+    visible_text: z.string().optional(),
+    description: z.string().optional(),
+    before_relevance: z.string().optional(),
+    after_relevance: z.string().optional(),
+    context_interpretation: z.string().optional(),
+  }).loose()),
+}).loose();
+export type EmbeddedImageEvidence = z.infer<typeof EmbeddedImageEvidenceSchema>;

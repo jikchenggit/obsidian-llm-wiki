@@ -27,7 +27,7 @@ import {
   type LLMFinishReason,
   type LLMFinishMeta,
   type LLMUsage,
-  type MessageContentPart,
+  type LLMMessage,
 } from '../types';
 import { obsidianFetchBridge, streamWithFallback } from '../core/obsidian-fetch-bridge';
 import { mapAiSdkError } from './openai-sdk-client';
@@ -55,6 +55,15 @@ export interface OpenAICompatSdkClientOptions {
   fetch?: typeof obsidianFetchBridge;
   /** Override streaming fetch (default: streamWithFallback). */
   streamFetch?: typeof streamWithFallback;
+  /**
+   * Issue #723: extra headers sent on every request. Composed by the factory
+   * from three sources in precedence order — plugin identity
+   * (`User-Agent: karpathywiki/<version>`), the provider preset's own defaults
+   * (e.g. OpenCode's session id), then the user's custom headers. The AI SDK
+   * adds `Authorization` from `apiKey` ahead of these and documents the custom
+   * map as overriding, so a user header wins over both.
+   */
+  headers?: Record<string, string>;
 }
 
 // Issue #414 wire-field dialect lives in core (shared with the error-hint
@@ -145,6 +154,8 @@ export class OpenAICompatSdkClient implements LLMClient {
    * document `repetition_penalty`).
    */
   private readonly repetitionPenaltyWireField: 'repeat_penalty' | 'repetition_penalty' | null;
+  /** Issue #723: request headers composed by the factory. See the option's doc. */
+  private readonly headers: Record<string, string> | undefined;
 
   constructor(opts: OpenAICompatSdkClientOptions) {
     this.apiKey = opts.apiKey;
@@ -155,6 +166,7 @@ export class OpenAICompatSdkClient implements LLMClient {
     this.supportsStructuredOutputs
       = PREDEFINED_PROVIDERS[opts.provider]?.supportsStructuredOutputs ?? false;
     this.repetitionPenaltyWireField = repetitionPenaltyWireField(opts.provider);
+    this.headers = opts.headers;
   }
 
   /**
@@ -202,6 +214,40 @@ export class OpenAICompatSdkClient implements LLMClient {
    * streamFetchImpl pulls in a bit more code path; tests that
    * want to mock non-stream fetch pass fetchImpl explicitly.
    */
+  /**
+   * Issue #723: apply the composed headers on the request instead of through
+   * `createOpenAICompatible({ headers })`.
+   *
+   * The provider-level option does work for ordinary headers, but it **cannot
+   * set `User-Agent`**: the SDK ends its option handling with
+   * `withUserAgentSuffix(headers, 'ai-sdk/openai-compatible/<v>')`
+   * (`@ai-sdk/openai-compatible@2.0.62/dist/index.mjs:1747`), which replaces
+   * whatever the caller supplied. Verified against a stub fetch, which received
+   * `ai/6.0.230 ai-sdk/provider-utils/...` despite an explicit `User-Agent`.
+   *
+   * Identifying the plugin rather than the SDK is the whole point for gateways
+   * that route on it, so the headers are set after the SDK has built its own.
+   *
+   * Returns the fetch untouched when the client has no headers at all — which
+   * in production does not happen: the factory always supplies the identity
+   * header, so every compat request goes through the wrapper. The untouched path
+   * exists for clients constructed directly, as the wire tests do.
+   */
+  private withRequestHeaders(fetchFn: unknown): unknown {
+    const headers = this.headers;
+    if (!headers || Object.keys(headers).length === 0) return fetchFn;
+    return async (url: unknown, init?: { headers?: unknown }) => {
+      const merged = new Headers(init?.headers as HeadersInit);
+      for (const [name, value] of Object.entries(headers)) {
+        // An empty value is the user's deliberate "do not send this one".
+        if (value === '') merged.delete(name);
+        else merged.set(name, value);
+      }
+      const inner = fetchFn as (u: unknown, i?: unknown) => Promise<unknown>;
+      return inner(url, { ...(init ?? {}), headers: merged });
+    };
+  }
+
   private getProvider(modelId: string, fetchFn: typeof obsidianFetchBridge | typeof streamWithFallback = this.streamFetchImpl, baseURLOverride?: string): LanguageModel {
     // v1.23.0 P1.5: baseURLOverride lets the fallback retry path pass a
     // corrected URL (e.g., `/v1` appended for Kimi Coding Plan) without
@@ -211,7 +257,7 @@ export class OpenAICompatSdkClient implements LLMClient {
       name: this.provider,
       baseURL: effectiveBaseURL,
       apiKey: this.apiKey,
-      fetch: (fetchFn ?? this.streamFetchImpl) as unknown as typeof fetch,
+      fetch: this.withRequestHeaders(fetchFn ?? this.streamFetchImpl) as typeof fetch,
       // includeUsage: Some OpenAI-compatible providers (DeepSeek, GLM)
       // don't return usage unless asked. AI-SDK's default is true for
       // OpenAI; we set it explicitly to ensure consistent token tracking.
@@ -336,7 +382,8 @@ export class OpenAICompatSdkClient implements LLMClient {
       const result = await generateText({
         model: languageModel,
         ...(system ? { system } : {}),
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        messages,
+        ...(abortSignal ? { abortSignal } : {}),
         maxOutputTokens: max_tokens,
         ...outputArgs,
         providerOptions: this.buildProviderOptions({
@@ -511,7 +558,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const result = await generateText({
           model: retryLanguageModel,
           ...(system ? { system } : {}),
-          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+          messages,
           maxOutputTokens: max_tokens,
           ...outputArgs,
           providerOptions: this.buildProviderOptions({
@@ -596,7 +643,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const result = await generateText({
           model: retryLanguageModel,
           ...(system ? { system } : {}),
-          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+          messages,
           maxOutputTokens: max_tokens,
           ...outputArgs,
           providerOptions: this.buildProviderOptions({
@@ -734,7 +781,7 @@ export class OpenAICompatSdkClient implements LLMClient {
           const result = await generateText({
             model: retryLanguageModel,
             ...(retrySystem ? { system: retrySystem } : {}),
-            messages: messages.map((m) => ({ role: m.role, content: m.content })),
+            messages,
             maxOutputTokens: max_tokens,
             ...buildOutputArgs(response_format, demotedMode),
             providerOptions: this.buildProviderOptions({
@@ -797,7 +844,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const result = await generateText({
           model: retryLanguageModel,
           ...(system ? { system } : {}),
-          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+          messages,
           maxOutputTokens: max_tokens,
           ...outputArgs,
           providerOptions: this.buildProviderOptions({
@@ -852,7 +899,7 @@ export class OpenAICompatSdkClient implements LLMClient {
     max_tokens: number;
     abortSignal?: AbortSignal;
     system?: string;
-    messages: Array<{ role: 'user' | 'assistant'; content: string | MessageContentPart[] }>;
+    messages: LLMMessage[];
     response_format?: { type: 'json_object'; schema?: Record<string, unknown> | z.ZodType };
     task?: string;
     outputModeOverride?: OutputMode;
@@ -916,7 +963,7 @@ export class OpenAICompatSdkClient implements LLMClient {
       const result = await generateText({
         model: languageModel,
         ...(system ? { system } : {}),
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        messages,
         maxOutputTokens: max_tokens,
         ...outputArgs,
         providerOptions: this.buildProviderOptions({
@@ -1039,7 +1086,7 @@ export class OpenAICompatSdkClient implements LLMClient {
               const retryResult = await generateText({
                 model: retryLanguageModel,
                 ...(retrySystem ? { system: retrySystem } : {}),
-                messages: messages.map((m) => ({ role: m.role, content: m.content })),
+                messages,
                 maxOutputTokens: max_tokens,
                 ...buildOutputArgs(response_format, 'text_prompt'),
                 providerOptions: this.buildProviderOptions({
@@ -1140,7 +1187,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const result = await generateText({
           model: retryLanguageModel,
           ...(system ? { system } : {}),
-          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+          messages,
           maxOutputTokens: max_tokens,
           ...outputArgs,
           providerOptions: this.buildProviderOptions({
@@ -1204,7 +1251,7 @@ export class OpenAICompatSdkClient implements LLMClient {
             const result = await generateText({
               model: retryLanguageModel,
               ...(retrySystem ? { system: retrySystem } : {}),
-              messages: messages.map((m) => ({ role: m.role, content: m.content })),
+              messages,
               maxOutputTokens: max_tokens,
               ...buildOutputArgs(response_format, demotedMode),
               providerOptions: this.buildProviderOptions({
@@ -1244,7 +1291,7 @@ export class OpenAICompatSdkClient implements LLMClient {
         const result = await generateText({
           model: retryLanguageModel,
           ...(system ? { system } : {}),
-          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+          messages,
           maxOutputTokens: max_tokens,
           ...outputArgs,
           providerOptions: this.buildProviderOptions({

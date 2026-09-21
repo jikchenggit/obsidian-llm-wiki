@@ -45,7 +45,7 @@ import { applyRelatedLinks } from './related-links';
 import { relatedListLines } from '../../core/related-sections';
 import { mergeFrontmatter, parseFrontmatter, extractBody } from '../../core/frontmatter';
 import { incomingTypeTag } from '../../core/tag-vocab';
-import { collectActiveVocabulary } from '../../core/domain-axis';
+import { activeVocabulary } from '../../core/vocabulary';
 import { appendContradictedByMarker } from '../../core/contradicted-marker';
 import { buildContradictionRecord } from '../../core/contradiction-record';
 import { describeDemotion } from './contradiction-gates';
@@ -60,6 +60,7 @@ import { applyComplementaryAppends } from './complementary-appends';
 import { firstQuotesForPrompt, isConversationSource, mergeError } from './contextualize';
 import { buildNoteExcerpt, renderNoteExcerptBlock } from './note-window';
 import { localDateStamp } from '../../core/format';
+import type { WikiPageRef } from '../../types';
 
 /**
  * Minimal context contract required by mergePage / appendToReviewedPage.
@@ -70,6 +71,8 @@ export interface MergeContext {
   settings: LLMWikiSettings;
   getClient(): LLMClient | null;
   buildSystemPrompt(mode: 'full' | 'compact' | 'merge'): Promise<string>;
+  /** The wiki page index, through the engine's own held copy (Issue #662). */
+  getExistingWikiPages(): Promise<WikiPageRef[]>;
   createOrUpdateFile(path: string, content: string): Promise<void>;
   tryReadFile(path: string): Promise<string | null>;
   /** Optional: receives each contradiction the triage lane records (see EngineContext). */
@@ -104,7 +107,7 @@ export async function mergePage(
     const { frontmatter, body: existingBody } = mergeFrontmatter(
       existingContent,
       sourceSlug ? `sources/${sourceSlug}` : sourceFile.path,
-      incomingTypeTag(ctx.settings, pageType, info.type, collectActiveVocabulary(ctx.app as never, ctx.settings)),
+      incomingTypeTag(ctx.settings, pageType, info.type, activeVocabulary(ctx.app as never, ctx.settings, pageType)),
       info.domains, // domain axis stage 3 (#568): union the extraction's domain subset
     );
 
@@ -470,7 +473,7 @@ export async function appendToReviewedPage(
     const { frontmatter, body: existingBody } = mergeFrontmatter(
       existingContent,
       sourceSlug ? `sources/${sourceSlug}` : sourceFile.path,
-      incomingTypeTag(ctx.settings, pageKind, info.type, collectActiveVocabulary(ctx.app as never, ctx.settings)),
+      incomingTypeTag(ctx.settings, pageKind, info.type, activeVocabulary(ctx.app as never, ctx.settings, pageKind)),
       info.domains, // domain axis stage 3 (#568): union the extraction's domain subset
     );
 
