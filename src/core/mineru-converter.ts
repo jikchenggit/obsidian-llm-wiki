@@ -14,6 +14,7 @@ import {
   hashCacheKey,
   sha256Bytes,
 } from './pdf-cache';
+import { bytesToBase64 } from './pdf-converter';
 import type { ConversionResult, PdfConversionContext } from './pdf-converter';
 
 interface MineruEnvelope {
@@ -214,7 +215,147 @@ export function extractMarkdownFromMineruApiResponse(json: unknown, filename?: s
   throw new MineruPdfError('MinerU response did not contain markdown content.');
 }
 
-async function convertWithSelfHostedMineru(
+async function convertWithMineruV1(
+  bytes: Uint8Array,
+  filename: string,
+  v1BaseUrl: string,
+  token: string | undefined,
+  deadline: number,
+  signal?: AbortSignal,
+  onPhase?: (phase: MineruPhase) => void,
+): Promise<{ status: 'ok'; markdown: string } | { status: 'not-found' }> {
+  throwIfAborted(signal);
+  onPhase?.('uploading');
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const jobPayload = JSON.stringify({
+    files: [
+      {
+        source: {
+          type: 'inline',
+          name: filename,
+          data: bytesToBase64(bytes),
+        },
+      },
+    ],
+  });
+
+  const jobResponse = await withDeadline(requestUrl({
+    url: `${v1BaseUrl}/parse/jobs`,
+    method: 'POST',
+    headers,
+    body: jobPayload,
+    throw: false,
+  }), deadline, signal);
+
+  if (jobResponse.status === 404) {
+    return { status: 'not-found' };
+  }
+
+  if (jobResponse.status < 200 || jobResponse.status >= 300) {
+    const errData = jobResponse.json as { detail?: string; message?: string } | undefined;
+    const msg = typeof errData?.detail === 'string'
+      ? errData.detail
+      : typeof errData?.message === 'string'
+        ? errData.message
+        : `MinerU request failed with HTTP ${jobResponse.status}.`;
+    throw new MineruPdfError(msg);
+  }
+
+  const jobJson = jobResponse.json as {
+    job_id?: string;
+    status?: string;
+    files?: Array<{
+      status?: string;
+      output_files?: { markdown?: { file_id?: string } };
+      error?: { message?: string };
+    }>;
+  } | undefined;
+
+  const jobId = stringValue(jobJson?.job_id);
+  if (!jobId) {
+    throw new MineruPdfError('MinerU returned an invalid job response.');
+  }
+
+  let fileId: string | undefined;
+  if (jobJson?.status === 'completed') {
+    const file = jobJson.files?.[0];
+    fileId = stringValue(file?.output_files?.markdown?.file_id);
+  }
+
+  while (!fileId && Date.now() < deadline) {
+    throwIfAborted(signal);
+    onPhase?.('waiting');
+
+    const pollResponse = await withDeadline(requestUrl({
+      url: `${v1BaseUrl}/parse/jobs/${encodeURIComponent(jobId)}`,
+      method: 'GET',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      throw: false,
+    }), deadline, signal);
+
+    if (pollResponse.status < 200 || pollResponse.status >= 300) {
+      throw new MineruPdfError(`MinerU request failed with HTTP ${pollResponse.status}.`);
+    }
+
+    const pollJson = pollResponse.json as {
+      status?: string;
+      files?: Array<{
+        status?: string;
+        output_files?: { markdown?: { file_id?: string } };
+        error?: { message?: string };
+      }>;
+    } | undefined;
+
+    const taskStatus = pollJson?.status;
+    const fileResult = pollJson?.files?.[0];
+
+    if (taskStatus === 'completed' || fileResult?.status === 'completed') {
+      fileId = stringValue(fileResult?.output_files?.markdown?.file_id);
+      if (!fileId) {
+        throw new MineruPdfError('MinerU returned no markdown file ID.');
+      }
+      break;
+    }
+
+    if (taskStatus === 'failed' || fileResult?.status === 'failed') {
+      const errMsg = stringValue(fileResult?.error?.message);
+      throw new MineruPdfError(errMsg ?? 'MinerU conversion failed.', classifyMineruFailure(errMsg));
+    }
+
+    if (taskStatus === 'canceled' || taskStatus === 'cancelled') {
+      throw new MineruPdfError('MinerU conversion was cancelled.');
+    }
+
+    await withDeadline(new Promise(resolve => window.setTimeout(resolve, MINERU_POLL_INTERVAL_MS)), deadline, signal);
+  }
+
+  if (!fileId) {
+    throw new MineruPdfError('MinerU conversion timed out after 30 minutes.');
+  }
+
+  onPhase?.('downloading');
+  const contentResponse = await withDeadline(requestUrl({
+    url: `${v1BaseUrl}/files/${encodeURIComponent(fileId)}/content`,
+    method: 'GET',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    throw: false,
+  }), deadline, signal);
+
+  if (contentResponse.status < 200 || contentResponse.status >= 300) {
+    throw new MineruPdfError(`MinerU result download failed with HTTP ${contentResponse.status}.`);
+  }
+
+  return { status: 'ok', markdown: contentResponse.text };
+}
+
+async function convertWithLegacyFileParse(
   bytes: Uint8Array,
   filename: string,
   baseUrl: string,
@@ -258,6 +399,27 @@ async function convertWithSelfHostedMineru(
   }
 
   return extractMarkdownFromMineruApiResponse(response.json, filename);
+}
+
+async function convertWithSelfHostedMineru(
+  bytes: Uint8Array,
+  filename: string,
+  baseUrl: string,
+  token: string | undefined,
+  deadline: number,
+  signal?: AbortSignal,
+  onPhase?: (phase: MineruPhase) => void,
+): Promise<string> {
+  const cleanBase = baseUrl.replace(/\/+$/, '');
+  const v1Base = cleanBase.endsWith('/v1') ? cleanBase : `${cleanBase}/v1`;
+  const legacyBase = cleanBase.replace(/\/v1$/, '');
+
+  const v1Result = await convertWithMineruV1(bytes, filename, v1Base, token, deadline, signal, onPhase);
+  if (v1Result.status === 'ok') {
+    return v1Result.markdown;
+  }
+
+  return convertWithLegacyFileParse(bytes, filename, legacyBase, token, deadline, signal, onPhase);
 }
 
 function validateRemoteUrl(value: string, baseUrl: string = MINERU_API_BASE_URL): string {

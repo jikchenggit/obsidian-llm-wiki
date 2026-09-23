@@ -252,7 +252,7 @@ function providerSupportsPdf(settings: PdfConversionContext['settings']): boolea
   return false;
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
+export function bytesToBase64(bytes: Uint8Array): string {
   // Avoid Node's `Buffer` (forbidden by obsidianmd/no-node-builtin rule).
   // The naive `btoa(String.fromCharCode(...bytes))` is O(n²) because each
   // String.fromCharCode + string-concat allocates a new string of the
