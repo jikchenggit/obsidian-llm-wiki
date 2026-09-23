@@ -358,33 +358,184 @@ describe('extractMarkdownFromMineruApiResponse', () => {
 });
 
 describe('convertPdfWithMineru (self-hosted mode)', () => {
-  it('calls /file_parse with multipart form data without requiring token', async () => {
+  it('calls /v1/parse/jobs with inline source, polls until completed, and downloads markdown', async () => {
     const pdfBuffer = new Uint8Array([1, 2, 3]).buffer;
-    requestUrlMock.mockResolvedValueOnce({
-      status: 200,
-      json: {
-        results: {
-          'paper.pdf': {
-            md_content: '# Self-Hosted Markdown Output',
-          },
+    requestUrlMock
+      // 1. POST /v1/parse/jobs
+      .mockResolvedValueOnce({
+        status: 202,
+        json: {
+          job_id: 'job-v1-abc',
+          status: 'queued',
         },
-      },
+      })
+      // 2. GET /v1/parse/jobs/job-v1-abc (running)
+      .mockResolvedValueOnce({
+        status: 200,
+        json: {
+          job_id: 'job-v1-abc',
+          status: 'running',
+        },
+      })
+      // 3. GET /v1/parse/jobs/job-v1-abc (completed)
+      .mockResolvedValueOnce({
+        status: 200,
+        json: {
+          job_id: 'job-v1-abc',
+          status: 'completed',
+          files: [
+            {
+              name: 'paper.pdf',
+              status: 'completed',
+              output_files: {
+                markdown: {
+                  file_id: 'file-output-xyz',
+                  bytes: 30,
+                },
+              },
+            },
+          ],
+        },
+      })
+      // 4. GET /v1/files/file-output-xyz/content
+      .mockResolvedValueOnce({
+        status: 200,
+        text: '# MinerU v1 Markdown Output\n\nContent here.',
+      });
+
+    const phases: string[] = [];
+    const ctx = context({
+      app: { vault: { adapter: { readBinary: vi.fn(async () => pdfBuffer) } } },
+      mineruApiToken: '',
+      mineruApiBaseUrl: 'http://192.168.10.166:8080/',
+      onMineruPhase: (phase: string) => phases.push(phase),
     });
+
+    const result = await convertPdfWithMineru(ctx);
+    expect(result.markdown).toBe('# MinerU v1 Markdown Output\n\nContent here.');
+    expect(requestUrlMock).toHaveBeenCalledTimes(4);
+
+    const jobCall = requestUrlMock.mock.calls[0][0];
+    expect(jobCall.url).toBe('http://192.168.10.166:8080/v1/parse/jobs');
+    expect(jobCall.method).toBe('POST');
+    const jobBody = JSON.parse(jobCall.body);
+    expect(jobBody.files[0].source.type).toBe('inline');
+    expect(jobBody.files[0].source.name).toBe('paper.pdf');
+    expect(typeof jobBody.files[0].source.data).toBe('string');
+    expect(jobCall.headers.Authorization).toBeUndefined();
+
+    const pollCall = requestUrlMock.mock.calls[1][0];
+    expect(pollCall.url).toBe('http://192.168.10.166:8080/v1/parse/jobs/job-v1-abc');
+    expect(pollCall.method).toBe('GET');
+
+    const downloadCall = requestUrlMock.mock.calls[3][0];
+    expect(downloadCall.url).toBe('http://192.168.10.166:8080/v1/files/file-output-xyz/content');
+    expect(downloadCall.method).toBe('GET');
+
+    expect(phases).toEqual(['uploading', 'waiting', 'waiting', 'downloading']);
+  });
+
+  it('handles /v1 base URL without duplicate /v1 segments and includes token when provided', async () => {
+    const pdfBuffer = new Uint8Array([1, 2, 3]).buffer;
+    requestUrlMock
+      .mockResolvedValueOnce({
+        status: 200,
+        json: {
+          job_id: 'job-token',
+          status: 'completed',
+          files: [
+            {
+              output_files: {
+                markdown: { file_id: 'file-token-res' },
+              },
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        text: '# Token Authed Result',
+      });
 
     const ctx = context({
       app: { vault: { adapter: { readBinary: vi.fn(async () => pdfBuffer) } } },
-      mineruApiToken: '', // No token required for self-hosted
+      mineruApiToken: 'my-custom-key',
+      mineruApiBaseUrl: 'http://my-host:8080/v1',
+    });
+
+    const result = await convertPdfWithMineru(ctx);
+    expect(result.markdown).toBe('# Token Authed Result');
+    expect(requestUrlMock.mock.calls[0][0].url).toBe('http://my-host:8080/v1/parse/jobs');
+    expect(requestUrlMock.mock.calls[0][0].headers.Authorization).toBe('Bearer my-custom-key');
+    expect(requestUrlMock.mock.calls[1][0].url).toBe('http://my-host:8080/v1/files/file-token-res/content');
+    expect(requestUrlMock.mock.calls[1][0].headers.Authorization).toBe('Bearer my-custom-key');
+  });
+
+  it('handles v1 parse failure with error message from server', async () => {
+    const pdfBuffer = new Uint8Array([1, 2, 3]).buffer;
+    requestUrlMock
+      .mockResolvedValueOnce({
+        status: 202,
+        json: { job_id: 'job-fail' },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        json: {
+          job_id: 'job-fail',
+          status: 'failed',
+          files: [
+            {
+              error: {
+                message: 'Failed to load document (PDFium: Data format error).',
+              },
+            },
+          ],
+        },
+      });
+
+    const ctx = context({
+      app: { vault: { adapter: { readBinary: vi.fn(async () => pdfBuffer) } } },
+      mineruApiBaseUrl: 'http://192.168.1.100:8000',
+    });
+
+    await expect(convertPdfWithMineru(ctx)).rejects.toThrow(
+      'Failed to load document (PDFium: Data format error).',
+    );
+  });
+
+  it('falls back to legacy /file_parse when /v1/parse/jobs returns 404', async () => {
+    const pdfBuffer = new Uint8Array([1, 2, 3]).buffer;
+    requestUrlMock
+      // 1. POST /v1/parse/jobs returns 404 (legacy server)
+      .mockResolvedValueOnce({
+        status: 404,
+        json: { detail: 'Not Found' },
+      })
+      // 2. Fallback to POST /file_parse succeeds
+      .mockResolvedValueOnce({
+        status: 200,
+        json: {
+          results: {
+            'paper.pdf': {
+              md_content: '# Legacy File Parse Markdown',
+            },
+          },
+        },
+      });
+
+    const ctx = context({
+      app: { vault: { adapter: { readBinary: vi.fn(async () => pdfBuffer) } } },
+      mineruApiToken: '',
       mineruApiBaseUrl: 'http://192.168.1.100:8000',
     });
 
     const result = await convertPdfWithMineru(ctx);
-    expect(result.markdown).toBe('# Self-Hosted Markdown Output');
-    expect(requestUrlMock).toHaveBeenCalledTimes(1);
-    const call = requestUrlMock.mock.calls[0][0];
-    expect(call.url).toBe('http://192.168.1.100:8000/file_parse');
-    expect(call.method).toBe('POST');
-    expect(call.headers['Content-Type']).toContain('multipart/form-data; boundary=');
-    expect(call.headers.Authorization).toBeUndefined();
+    expect(result.markdown).toBe('# Legacy File Parse Markdown');
+    expect(requestUrlMock).toHaveBeenCalledTimes(2);
+
+    expect(requestUrlMock.mock.calls[0][0].url).toBe('http://192.168.1.100:8000/v1/parse/jobs');
+    expect(requestUrlMock.mock.calls[1][0].url).toBe('http://192.168.1.100:8000/file_parse');
+    expect(requestUrlMock.mock.calls[1][0].headers['Content-Type']).toContain('multipart/form-data; boundary=');
   });
 });
 
